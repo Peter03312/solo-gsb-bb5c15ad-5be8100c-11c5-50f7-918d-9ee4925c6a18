@@ -15,6 +15,7 @@
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
 - POST /api/delivery/allocate                          保障等级分档交付核算（只读：按等级总量、再逐点字典序最大化交付）
 - POST /api/meters/reconcile                           管段流量计读数核对（只读：一致性 + 缺报读数可行流量范围）
+- POST /api/drill                                      调度演练（只读：按顺序演练一串隔离/复供/水源切换，逐步套用提交校验）
 
 状态回看（快照）：
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
@@ -31,6 +32,7 @@ from .config import get_settings
 from .planning import (
     Node,
     Pipe,
+    DrillStep,
     diff_states,
     allocate_delivery,
     evaluate_delivery,
@@ -38,11 +40,15 @@ from .planning import (
     evaluate_restore,
     evaluate_source_switch,
     recommend_plan,
+    simulate_drill,
     validate_delivery_request,
     validate_reconcile_request,
     reconcile_meters,
     validate_import,
     BLOCKING_ISSUE_CODES,
+    DRILL_STEP_ISOLATION,
+    DRILL_STEP_RESTORE,
+    DRILL_STEP_SOURCE_SWITCH,
 )
 from .schemas import (
     ImportIn,
@@ -53,6 +59,9 @@ from .schemas import (
     DeliveryEvaluateIn,
     DeliveryAllocateIn,
     MeterReconcileIn,
+    DrillIn,
+    DrillIsolationStepIn,
+    DrillRestoreStepIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -65,6 +74,7 @@ from .schemas import (
     DeliveryEvaluateOut,
     DeliveryAllocateOut,
     MeterReconcileOut,
+    DrillOut,
     EventOut,
     SnapshotOut,
     SnapshotMetaOut,
@@ -78,6 +88,7 @@ from .serializers import (
     serialize_delivery,
     serialize_allocation,
     serialize_reconcile,
+    serialize_drill,
     serialize_snapshot,
     serialize_snapshot_row,
     serialize_snapshot_diff,
@@ -101,7 +112,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -719,3 +730,67 @@ def diff_snapshot(
     # 只基于两份冻结载荷计算，绝不读取当前管网或后续事件回填
     diff = diff_states(base["state"] if base else None, target["state"])
     return serialize_snapshot_diff(base, target, diff)
+
+
+# ---------------------------------------------------------------- 调度演练（只读）
+
+
+def _to_domain_drill_steps(payload: DrillIn) -> list[DrillStep]:
+    steps: list[DrillStep] = []
+    for s in payload.steps:
+        if isinstance(s, DrillIsolationStepIn):
+            steps.append(
+                DrillStep(
+                    type=DRILL_STEP_ISOLATION,
+                    fault_pipe_id=s.fault_pipe_id,
+                    close_pipe_ids=list(s.close_pipe_ids),
+                )
+            )
+        elif isinstance(s, DrillRestoreStepIn):
+            steps.append(
+                DrillStep(
+                    type=DRILL_STEP_RESTORE,
+                    event_id=s.event_id,
+                    temp_event_ref=s.temp_event_ref,
+                )
+            )
+        else:
+            steps.append(
+                DrillStep(
+                    type=DRILL_STEP_SOURCE_SWITCH,
+                    targets=[(t.source_id, t.running) for t in s.targets],
+                )
+            )
+    return steps
+
+
+@app.post(
+    "/api/drill",
+    response_model=DrillOut,
+    tags=["调度演练"],
+    summary="调度演练：以当前状态为起点，按顺序只读演练一串隔离/复供/水源切换操作",
+)
+def drill_operations(payload: DrillIn):
+    # 全程只读：仅读取当前状态，在内存副本上逐步推演，不写版本/阀位/事件/快照
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        # 版本过期：返回当前版本并拒绝演练（不执行任何步骤）
+        if version != payload.version:
+            raise db.VersionConflict(version, payload.version)
+        # 现存事件：全部待修复事件 + 复供步骤引用到的其他现存事件
+        # （已复供事件仅用于精确区分 EVENT_NOT_FOUND / EVENT_ALREADY_RESTORED）
+        real_events = {e["id"]: e for e in db.list_open_events(conn)}
+        for step in payload.steps:
+            if (
+                isinstance(step, DrillRestoreStepIn)
+                and step.event_id is not None
+                and step.event_id not in real_events
+            ):
+                event = db.get_event(conn, step.event_id)
+                if event is not None:
+                    real_events[step.event_id] = event
+
+    result = simulate_drill(
+        nodes, pipes, real_events, _to_domain_drill_steps(payload)
+    )
+    return serialize_drill(version, result)

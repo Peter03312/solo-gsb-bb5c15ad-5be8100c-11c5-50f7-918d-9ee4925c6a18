@@ -17,9 +17,13 @@
 供水不足时还可携带各用水点的**保障等级**（数字越小越优先），**只读核算分档交付**：
 先按等级依次最大化该等级交付总量，再在各等级总量最优条件下按（等级、用水点编号）
 逐点最大化交付量，返回各点交付与缺口，结果由一组同时可行的整数流量实现。
+调度员在执行前还可把一串**有序的隔离、复供、水源切换操作**交给**调度演练**接口
+**只读预检**：以当前状态为起点逐步套用既有提交校验，复供可引用现存待修复事件或
+本次演练先前隔离产生的**临时事件**，逐步给出新增失供/恢复供水用水点与最终
+运行水源、阀位、待修复故障、通水用水点，首个非法或不安全步骤即标明原因并停止。
 
 > 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、
-> 流量核算、分档交付）只以**运行中**的水源为供水起点；停运水源不再供水。
+> 流量核算、分档交付、调度演练）只以**运行中**的水源为供水起点；停运水源不再供水。
 
 ---
 
@@ -235,6 +239,40 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - 该接口为纯只读新增，**原有流量核算接口 `/api/delivery/evaluate` 的语义与返回
   保持不变**（内部新增可复用的 Dinic 类，既有 `_undirected_max_flow` 未改动）。
 
+**调度演练**（`POST /api/drill`，**只读**，不改版本/阀位/水源状态/事件/快照）：
+
+- 入参为已读 `version` + 一串**有序步骤**（`steps`，可为空列表——只回显当前状态）；
+  每步三选一（按 `type` 区分）：
+  - `isolation`：隔离，`fault_pipe_id` + `close_pipe_ids`（拟关阀门）；
+  - `restore`：复供，`event_id`（现存待修复事件）或 `temp_event_ref`
+    （本次演练先前隔离步骤产生的**临时事件**，形如 `T<步骤序号>`，序号从 1 起），
+    二者必须且只能给出一个；
+  - `source_switch`：水源切换，`targets` 为一组 `{source_id, running}`（同批不重复）。
+- **版本过期整体拒绝**：`version` 不等于当前版本时返回
+  `409 VERSION_CONFLICT`（响应体含当前版本 `current_version`），不执行任何步骤；
+  这与提交类接口一致——演练是对一串**提交**的预检。
+- 以当前状态为起点，在**状态副本**上逐步套用与既有提交接口**完全一致**的校验：
+  隔离按提交口径（`for_submit`：故障两端须均可隔离、已关闭阀门不得重复关闭、
+  无阀管段不可关等）；复供与恢复水源不得使任一**待修复**故障管段端点重新进水；
+  其他待修复故障管段在每一步的通水计算中持续阻断。
+- 每步的**新增失供**（`affected_sink_ids`）与**恢复供水**（`restored_sink_ids`）
+  用水点均**相对上一步结束状态**计算；隔离步骤成功后产生临时事件
+  （回显 `temp_event_ref`，如 `T1`、`T3`），供后续复供步骤引用。
+- **首个失败步骤即停**：任一步非法或不安全时，响应 `ok=false`、
+  `failed_step_index` 为失败步骤序号（从 1 起），`steps` 只包含到该步为止的结果，
+  该步 `error` 给出原因码与明细，后续步骤不再演练，`final` 为 `null`。
+  失败原因码与单步接口一致：`PLAN_INVALID` / `NOT_ISOLATABLE`（隔离）、
+  `EVENT_NOT_FOUND` / `EVENT_ALREADY_RESTORED` / `RESTORE_UNSAFE`（复供，
+  风险明细在 `error.block_reasons`，代码同为 `FAULT_REWATER_RISK`）、
+  `SOURCE_SWITCH_INVALID` / `SOURCE_SWITCH_UNSAFE`（水源切换）。
+- 全部步骤成功时 `ok=true`，`final` 给出推演终态：全部水源运行状态 `sources`、
+  全部有阀管段阀位 `valves`、仍待修复的故障 `open_faults`
+  （现存事件给 `event_id`、临时事件给 `temp_event_ref`）与
+  通水用水点 `supplied_sink_ids`（口径与快照一致：仅运行水源可达）。
+- 请求体结构非法（未知步骤类型、复供步骤引用缺失或重复、目标列表为空等）
+  返回 `422` 请求校验错误；演练本身**永不写入**：不产生版本推进、阀位变化、
+  事件变化或状态快照。既有单步接口（预演/提交/确认）的契约保持不变。
+
 **状态快照（操作后回看）**（只增不改，编号由数据库序列全局单调分配，**不可复用**）：
 
 - 仅四类**实际改变状态**的写操作产生快照，且与状态变更在**同一事务**内冻结：
@@ -277,6 +315,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/delivery/evaluate` | 用水点最低流量核算（只读：现有阀位/故障下的最大可交付总量，整数最大流） |
 | POST | `/api/delivery/allocate` | 保障等级分档交付（只读：先按等级总量、再按等级/编号逐点最大化各点交付与缺口） |
 | POST | `/api/meters/reconcile` | 管段流量计读数核对（只读：一致性校验 + 缺报管段可行流量最小/最大值，整数有界可行流） |
+| POST | `/api/drill` | 调度演练（只读：有序隔离/复供/水源切换逐步预检，临时事件引用，首个失败步骤即停） |
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
 | GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
 | GET | `/api/snapshots/{snapshot_id}/diff?base_id=` | 相邻快照六类净变化对照（缺省对照上一条；首条无基线全计为新增） |
@@ -1048,6 +1087,97 @@ python3 examples/meter_reconcile_demo.py http://localhost:8000
 编号未覆盖/重复/未知节点与类型错误的 422 拒绝 → 确认版本、阀位、水源状态与事件
 全程未被改写。
 
+### 14. 调度演练（只读：一串操作执行前的逐步预检）
+
+调度员把一串**有序的隔离、复供、水源切换操作**连同已读版本一起提交演练；
+服务以当前状态为起点逐步套用既有提交校验，**全程只读**（不改版本、阀位、
+事件与快照）。演练使用复供演示管网 `examples/restore_network.json`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/network/import \
+  -H 'Content-Type: application/json' -d @examples/restore_network.json
+```
+
+五步连贯演练（隔离 → 复供临时事件 → 再隔离 → 停运 → 恢复水源）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/drill \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "steps": [
+      {"type": "isolation", "fault_pipe_id": "P6", "close_pipe_ids": ["P4"]},
+      {"type": "restore", "temp_event_ref": "T1"},
+      {"type": "isolation", "fault_pipe_id": "P7", "close_pipe_ids": ["P4", "P8"]},
+      {"type": "source_switch", "targets": [{"source_id": "S", "running": false}]},
+      {"type": "source_switch", "targets": [{"source_id": "S", "running": true}]}
+    ]
+  }'
+```
+
+响应（节选）：第 1 步隔离 P6 产生临时事件 `T1`、U3/U4 新增失供；第 2 步复供
+`T1` 使其恢复；第 3 步隔离 P7 产生 `T3`；第 4/5 步停运再恢复水源 S，
+失供/恢复均**相对上一步**计算；`final` 给出推演终态：
+
+```json
+{
+  "version": 1,
+  "ok": true,
+  "failed_step_index": null,
+  "steps": [
+    {"index": 1, "type": "isolation", "ok": true, "fault_pipe_id": "P6",
+     "close_pipe_ids": ["P4"], "temp_event_ref": "T1",
+     "affected_sink_ids": ["U3", "U4"], "restored_sink_ids": [], "error": null},
+    {"index": 2, "type": "restore", "ok": true, "temp_event_ref": "T1",
+     "reopened_pipe_ids": ["P4"], "affected_sink_ids": [],
+     "restored_sink_ids": ["U3", "U4"], "error": null}
+  ],
+  "final": {
+    "sources": [{"source_id": "S", "running": true}],
+    "valves": [
+      {"pipe_id": "P1", "valve_closed": false},
+      {"pipe_id": "P4", "valve_closed": true},
+      {"pipe_id": "P8", "valve_closed": true}
+    ],
+    "open_faults": [{"event_id": null, "temp_event_ref": "T3", "fault_pipe_id": "P7"}],
+    "supplied_sink_ids": ["U1"]
+  }
+}
+```
+
+本轮用法要点：
+
+- **临时事件引用**：第 `k` 步（从 1 起）隔离成功后产生临时事件 `T<k>`，
+  后续复供步骤用 `"temp_event_ref": "T<k>"` 引用；复供现存待修复事件用
+  `"event_id": <事件编号>`，二者必须且只能给出一个。
+- **版本过期整体拒绝**：`version` 与当前版本不一致时返回
+  `409 VERSION_CONFLICT`（响应体含 `current_version`），不执行任何步骤。
+- **首个失败步骤即停**：如“隔离区内故障 P7（临时事件 T1）后再复供外层事件”，
+  重开阀门会使 P7 的 D 端重新进水——响应 `ok=false`、`failed_step_index=2`、
+  该步 `error.code=RESTORE_UNSAFE`（`error.block_reasons` 含故障管段与
+  重新进水端点），后续步骤不再演练、`final` 为 `null`。
+- 复供引用不存在的事件编号或未产生的临时引用 → 该步
+  `error.code=EVENT_NOT_FOUND`；重复复供 → `EVENT_ALREADY_RESTORED`；
+  隔离步骤结构非法 → `PLAN_INVALID`（明细在 `error.issues`）；
+  不可隔离 → `NOT_ISOLATABLE`；水源切换编号非法 → `SOURCE_SWITCH_INVALID`、
+  重新进水风险 → `SOURCE_SWITCH_UNSAFE`。
+- 演练后真实状态不变：版本、阀位、事件、快照均与演练前一致；随后按既有
+  单步接口（提交/确认）执行时仍按各自契约复核版本与安全性。
+
+调度演练全流程演示脚本（标准库实现，全程只读）：
+
+```bash
+python3 examples/drill_demo.py
+# 或指定地址：
+python3 examples/drill_demo.py http://localhost:8000
+```
+
+脚本依次演示：五步连贯演练（隔离 → 复供临时事件 → 再隔离 → 停运/恢复水源）
+与最终状态汇总 → 演练只读核对 → 真实提交隔离事件 → 演练复供现存事件 →
+复供外层事件触发区内故障重新进水（RESTORE_UNSAFE，首败即停）→
+过期版本 409 → 引用不存在事件 EVENT_NOT_FOUND → 再次确认只读，
+并按既有接口真实复供（单步契约不变）。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -1074,15 +1204,23 @@ python3 examples/source_switch_demo.py
 python3 examples/source_switch_demo.py http://localhost:8000
 ```
 
+调度演练流程（五步连贯演练与最终状态 → 复供现存/临时事件 → 重新进水风险首败即停 → 过期版本 409 → 引用不存在事件 → 全程只读核对）：
+
+```bash
+python3 examples/drill_demo.py
+# 或指定地址：
+python3 examples/drill_demo.py http://localhost:8000
+```
+
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，90 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，103 个用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，92 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，103 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1095,7 +1233,7 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、状态快照冻结与相邻对照
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、调度演练(状态副本上逐步套用提交校验的只读推演)、状态快照冻结与相邻对照
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
@@ -1110,6 +1248,7 @@ examples/
   delivery_demo.py        # 用水点最低流量核算全流程示例（只读：水源/管段上限、瓶颈、停运/关阀阻断）
   allocate_demo.py        # 保障等级分档交付全流程示例（只读：等级总量优先、同等级编号序、缺口、阻断口径、422）
   meter_reconcile_demo.py # 管段流量计读数核对全流程示例（只读：一致性、缺报范围、停运/关阀/故障硬约束、422）
+  drill_demo.py           # 调度演练全流程示例（只读：有序步骤逐步预检、临时事件引用、首败即停、409/只读核对）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
 tests/
   test_planning.py

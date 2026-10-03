@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.planning import (  # noqa: E402
     Node,
     Pipe,
+    DrillStep,
     diff_states,
     allocate_delivery,
     evaluate_delivery,
@@ -20,11 +21,22 @@ from app.planning import (  # noqa: E402
     freeze_state,
     reachable_sink_ids,
     recommend_plan,
+    simulate_drill,
     validate_delivery_request,
     validate_reconcile_request,
     reconcile_meters,
     validate_import,
     _undirected_max_flow,
+    DRILL_STEP_ISOLATION,
+    DRILL_STEP_RESTORE,
+    DRILL_STEP_SOURCE_SWITCH,
+    PLAN_INVALID,
+    NOT_ISOLATABLE,
+    EVENT_NOT_FOUND,
+    EVENT_ALREADY_RESTORED,
+    RESTORE_UNSAFE,
+    SOURCE_SWITCH_INVALID,
+    SOURCE_SWITCH_UNSAFE,
     DUPLICATE_NODE_ID,
     DUPLICATE_PIPE_ID,
     PIPE_SELF_LOOP,
@@ -1435,6 +1447,316 @@ class ReconcileMetersTests(unittest.TestCase):
         result = reconcile_meters({}, {}, [], [], [])
         self.assertTrue(result.consistent)
         self.assertEqual(result.readings, [])
+
+
+def build_drill_network():
+    """演练测试管网（同 examples/restore_network.json）：
+
+    S --P1(v)-- A --P2(v)-- B --P4(v)-- D --P6(无阀)-- U3
+                 |                     |
+               P3(v)                 P7(无阀)-- E --P8(v)-- U4
+                 |
+                 U1
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "B": Node("B", "junction"),
+        "D": Node("D", "junction"),
+        "E": Node("E", "junction"),
+        "U1": Node("U1", "sink"),
+        "U3": Node("U3", "sink"),
+        "U4": Node("U4", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A", has_valve=True),
+        "P2": Pipe("P2", "A", "B", has_valve=True),
+        "P3": Pipe("P3", "A", "U1", has_valve=True),
+        "P4": Pipe("P4", "B", "D", has_valve=True),
+        "P6": Pipe("P6", "D", "U3"),
+        "P7": Pipe("P7", "D", "E"),
+        "P8": Pipe("P8", "E", "U4", has_valve=True),
+    }
+    return nodes, pipes
+
+
+def build_drill_two_source_network():
+    """双水源演练测试管网：
+
+    S1 --Q1(v)-- C --Q2(v)-- U1
+    S2 --Q3(v)-- C --Q4(v)-- U2
+    """
+    nodes = {
+        "S1": Node("S1", "source"),
+        "S2": Node("S2", "source"),
+        "C": Node("C", "junction"),
+        "U1": Node("U1", "sink"),
+        "U2": Node("U2", "sink"),
+    }
+    pipes = {
+        "Q1": Pipe("Q1", "S1", "C", has_valve=True),
+        "Q3": Pipe("Q3", "S2", "C", has_valve=True),
+        "Q2": Pipe("Q2", "C", "U1", has_valve=True),
+        "Q4": Pipe("Q4", "C", "U2", has_valve=True),
+    }
+    return nodes, pipes
+
+
+class DrillTests(unittest.TestCase):
+    """调度演练（simulate_drill）纯逻辑测试：只读、逐步校验、首败即停。"""
+
+    def test_empty_steps_returns_current_state(self):
+        nodes, pipes = build_drill_network()
+        result = simulate_drill(nodes, pipes, {}, [])
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.failed_step_index)
+        self.assertEqual(result.steps, [])
+        final = result.final
+        self.assertEqual(final.sources, [("S", True)])
+        self.assertEqual(
+            final.valves,
+            [("P1", False), ("P2", False), ("P3", False), ("P4", False), ("P8", False)],
+        )
+        self.assertEqual(final.open_faults, [])
+        self.assertEqual(final.supplied_sink_ids, ["U1", "U3", "U4"])
+
+    def test_isolation_then_restore_temp_event(self):
+        nodes, pipes = build_drill_network()
+        steps = [
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=["P4"]),
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T1"),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertTrue(result.ok)
+        s1, s2 = result.steps
+        # 第 1 步：隔离 P6 关 P4 -> 临时事件 T1，U3/U4 新增失供
+        self.assertTrue(s1.ok)
+        self.assertEqual(s1.temp_event_ref, "T1")
+        self.assertEqual(s1.affected_sink_ids, ["U3", "U4"])
+        self.assertEqual(s1.restored_sink_ids, [])
+        # 第 2 步：复供 T1 -> 重开 P4，U3/U4 恢复（相对上一步）
+        self.assertTrue(s2.ok)
+        self.assertEqual(s2.reopened_pipe_ids, ["P4"])
+        self.assertEqual(s2.restored_sink_ids, ["U3", "U4"])
+        self.assertEqual(s2.affected_sink_ids, [])
+        # 最终：无待修复故障、阀门全开、全部通水
+        self.assertEqual(result.final.open_faults, [])
+        self.assertTrue(all(not closed for _pid, closed in result.final.valves))
+        self.assertEqual(result.final.supplied_sink_ids, ["U1", "U3", "U4"])
+
+    def test_step_deltas_are_relative_to_previous_step(self):
+        nodes, pipes = build_drill_network()
+        steps = [
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=["P4"]),
+            # P7 已被 P4 隔离在上一步之后的状态里：空关阀即可隔离，且无新增失供
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P7", close_pipe_ids=[]),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.steps[0].affected_sink_ids, ["U3", "U4"])
+        self.assertEqual(result.steps[1].affected_sink_ids, [])
+        self.assertEqual(result.steps[1].temp_event_ref, "T2")
+        # 最终两条待修复故障（T1/T2 按产生步骤升序）
+        self.assertEqual(
+            result.final.open_faults,
+            [(None, "T1", "P6"), (None, "T2", "P7")],
+        )
+        self.assertEqual(result.final.supplied_sink_ids, ["U1"])
+
+    def test_full_sequence_with_source_switch_and_final_state(self):
+        nodes, pipes = build_drill_network()
+        steps = [
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=["P4"]),
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T1"),
+            DrillStep(
+                type=DRILL_STEP_ISOLATION, fault_pipe_id="P7", close_pipe_ids=["P4", "P8"]
+            ),
+            DrillStep(type=DRILL_STEP_SOURCE_SWITCH, targets=[("S", False)]),
+            DrillStep(type=DRILL_STEP_SOURCE_SWITCH, targets=[("S", True)]),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertTrue(result.ok)
+        # 停运：仅剩的 U1 新增失供；恢复：U1 恢复（P4/P8 仍关，U3/U4 不恢复）
+        self.assertEqual(result.steps[3].affected_sink_ids, ["U1"])
+        self.assertTrue(result.steps[3].changed)
+        self.assertEqual(result.steps[4].restored_sink_ids, ["U1"])
+        final = result.final
+        self.assertEqual(final.sources, [("S", True)])
+        self.assertEqual(
+            final.valves,
+            [("P1", False), ("P2", False), ("P3", False), ("P4", True), ("P8", True)],
+        )
+        self.assertEqual(final.open_faults, [(None, "T3", "P7")])
+        self.assertEqual(final.supplied_sink_ids, ["U1"])
+
+    def test_isolation_not_isolatable_stops_at_first_failure(self):
+        nodes, pipes = build_drill_network()
+        steps = [
+            # 空关阀：D 端仍经 P4 进水 -> 不可隔离
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=[]),
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P7", close_pipe_ids=[]),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failed_step_index, 1)
+        self.assertEqual(len(result.steps), 1)  # 后续步骤不再演练
+        self.assertEqual(result.steps[0].error.code, NOT_ISOLATABLE)
+        self.assertIsNone(result.final)
+
+    def test_isolation_plan_invalid_commit_semantics(self):
+        nodes, pipes = build_drill_network()
+        # 关闭无阀管段 P6（以 P7 为故障管段）-> PLAN_INVALID / CLOSE_PIPE_NO_VALVE
+        steps = [
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P7", close_pipe_ids=["P6"]),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.steps[0].error.code, PLAN_INVALID)
+        codes = {i.code for i in result.steps[0].error.issues}
+        self.assertIn(CLOSE_PIPE_NO_VALVE, codes)
+
+        # 提交口径：上一步已关的阀门不得重复关闭
+        steps = [
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=["P4"]),
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P7", close_pipe_ids=["P4"]),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failed_step_index, 2)
+        self.assertEqual(result.steps[1].error.code, PLAN_INVALID)
+        codes = {i.code for i in result.steps[1].error.issues}
+        self.assertIn(CLOSE_PIPE_DUPLICATE, codes)
+
+    def test_restore_rewater_risk_stops_drill(self):
+        nodes, pipes = build_drill_network()
+        steps = [
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=["P4"]),
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P7", close_pipe_ids=[]),
+            # 复供 T1 重开 P4 -> 待修复故障 P7 的 D 端重新进水
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T1"),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failed_step_index, 3)
+        error = result.steps[2].error
+        self.assertEqual(error.code, RESTORE_UNSAFE)
+        self.assertEqual(error.blocks[0].fault_pipe_id, "P7")
+        self.assertEqual(error.blocks[0].reachable_endpoints, ["D"])
+        self.assertIsNone(result.final)
+
+    def test_restore_real_event_and_reference_errors(self):
+        nodes, pipes = build_drill_network()
+        # 现存待修复事件 1（故障 P6，已关 P4）与已复供事件 2
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        real_events = {
+            1: {"fault_pipe_id": "P6", "closed_pipe_ids": ["P4"], "status": "open"},
+            2: {"fault_pipe_id": "P7", "closed_pipe_ids": [], "status": "restored"},
+        }
+        # 复供现存事件 1：重开 P4，U3/U4 恢复
+        result = simulate_drill(
+            nodes, pipes, real_events, [DrillStep(type=DRILL_STEP_RESTORE, event_id=1)]
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.steps[0].restored_sink_ids, ["U3", "U4"])
+        self.assertEqual(result.steps[0].reopened_pipe_ids, ["P4"])
+        self.assertEqual(result.final.open_faults, [])
+        self.assertEqual(result.final.supplied_sink_ids, ["U1", "U3", "U4"])
+
+        # 已复供事件再次复供 -> EVENT_ALREADY_RESTORED
+        result = simulate_drill(
+            nodes, pipes, real_events, [DrillStep(type=DRILL_STEP_RESTORE, event_id=2)]
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.steps[0].error.code, EVENT_ALREADY_RESTORED)
+
+        # 不存在的事件编号 / 未产生的临时引用 -> EVENT_NOT_FOUND
+        for step in (
+            DrillStep(type=DRILL_STEP_RESTORE, event_id=99),
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T9"),
+        ):
+            result = simulate_drill(nodes, pipes, real_events, [step])
+            self.assertFalse(result.ok)
+            self.assertEqual(result.steps[0].error.code, EVENT_NOT_FOUND)
+
+    def test_restore_temp_event_twice_in_one_drill(self):
+        nodes, pipes = build_drill_network()
+        steps = [
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=["P4"]),
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T1"),
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T1"),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failed_step_index, 3)
+        self.assertEqual(result.steps[2].error.code, EVENT_ALREADY_RESTORED)
+
+    def test_restore_forward_temp_reference_not_found(self):
+        nodes, pipes = build_drill_network()
+        # 第 1 步引用第 2 步才会产生的临时事件 T2 -> 不存在
+        steps = [
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T2"),
+            DrillStep(type=DRILL_STEP_ISOLATION, fault_pipe_id="P6", close_pipe_ids=["P4"]),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.failed_step_index, 1)
+        self.assertEqual(result.steps[0].error.code, EVENT_NOT_FOUND)
+
+    def test_source_switch_invalid_and_unsafe(self):
+        nodes, pipes = build_drill_two_source_network()
+        # 结构非法：编号不存在 / 非水源 / 同批重复 -> SOURCE_SWITCH_INVALID
+        steps = [
+            DrillStep(
+                type=DRILL_STEP_SOURCE_SWITCH,
+                targets=[("SX", False), ("U1", False), ("S1", False), ("S1", True)],
+            ),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertFalse(result.ok)
+        error = result.steps[0].error
+        self.assertEqual(error.code, SOURCE_SWITCH_INVALID)
+        codes = {i.code for i in error.issues}
+        self.assertEqual(
+            codes, {SOURCE_NOT_FOUND, SOURCE_NOT_SWITCHABLE, SOURCE_TARGET_DUPLICATE}
+        )
+
+        # S2 停运、故障 Q2 待修复（关 Q1）状态下恢复 S2 -> Q2 的 C 端重新进水
+        nodes["S2"] = Node("S2", "source", running=False)
+        pipes["Q1"] = Pipe("Q1", "S1", "C", has_valve=True, valve_closed=True)
+        real_events = {
+            1: {"fault_pipe_id": "Q2", "closed_pipe_ids": ["Q1"], "status": "open"},
+        }
+        steps = [DrillStep(type=DRILL_STEP_SOURCE_SWITCH, targets=[("S2", True)])]
+        result = simulate_drill(nodes, pipes, real_events, steps)
+        self.assertFalse(result.ok)
+        error = result.steps[0].error
+        self.assertEqual(error.code, SOURCE_SWITCH_UNSAFE)
+        self.assertEqual(error.blocks[0].fault_pipe_id, "Q2")
+        self.assertEqual(error.blocks[0].reachable_endpoints, ["C"])
+
+    def test_source_switch_noop_step_is_ok(self):
+        nodes, pipes = build_drill_two_source_network()
+        steps = [DrillStep(type=DRILL_STEP_SOURCE_SWITCH, targets=[("S1", True)])]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertTrue(result.ok)
+        self.assertFalse(result.steps[0].changed)
+        self.assertEqual(result.steps[0].affected_sink_ids, [])
+        self.assertEqual(result.steps[0].restored_sink_ids, [])
+
+    def test_drill_does_not_mutate_inputs(self):
+        nodes, pipes = build_drill_network()
+        steps = [
+            DrillStep(
+                type=DRILL_STEP_ISOLATION, fault_pipe_id="P7", close_pipe_ids=["P4", "P8"]
+            ),
+            DrillStep(type=DRILL_STEP_SOURCE_SWITCH, targets=[("S", False)]),
+            DrillStep(type=DRILL_STEP_RESTORE, temp_event_ref="T1"),
+        ]
+        result = simulate_drill(nodes, pipes, {}, steps)
+        self.assertTrue(result.ok)
+        # 输入的节点/管段对象均未被修改（全部状态演进发生在内部副本上）
+        self.assertTrue(all(not p.valve_closed for p in pipes.values()))
+        self.assertTrue(nodes["S"].running)
 
 
 if __name__ == "__main__":

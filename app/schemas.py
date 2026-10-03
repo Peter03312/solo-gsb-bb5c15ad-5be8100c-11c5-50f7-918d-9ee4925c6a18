@@ -8,9 +8,9 @@
 编号（id）为字符串，便于保留 "N01" 这类业务编号；排序时按字符串字典序。
 """
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 NodeType = Literal["source", "sink", "junction"]
 
@@ -402,6 +402,78 @@ class MeterReconcileIn(BaseModel):
     )
 
 
+# ---------------------------------------------------------------- 调度演练
+
+
+class DrillIsolationStepIn(BaseModel):
+    """演练单步：隔离（故障管段 + 拟关阀门，按提交口径校验）。"""
+
+    type: Literal["isolation"]
+    fault_pipe_id: str = Field(min_length=1, description="故障管段编号")
+    close_pipe_ids: list[str] = Field(
+        default_factory=list, description="拟关闭的阀门管段编号列表"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class DrillRestoreStepIn(BaseModel):
+    """演练单步：复供（引用现存待修复事件，或本次演练先前隔离产生的临时事件）。
+
+    临时事件引用形如 "T<步骤序号>"（序号从 1 起）：T3 即第 3 步隔离产生的
+    临时事件；event_id 与 temp_event_ref 必须且只能给出一个。
+    """
+
+    type: Literal["restore"]
+    event_id: int | None = Field(default=None, description="现存隔离事件编号")
+    temp_event_ref: str | None = Field(
+        default=None, min_length=1,
+        description="本次演练先前隔离步骤产生的临时事件引用（形如 T<步骤序号>）",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _exactly_one_ref(self):
+        if (self.event_id is None) == (self.temp_event_ref is None):
+            raise ValueError(
+                "复供步骤必须且只能给出 event_id 或 temp_event_ref 之一"
+            )
+        return self
+
+
+class DrillSourceSwitchStepIn(BaseModel):
+    """演练单步：水源切换（一批水源的目标运行状态）。"""
+
+    type: Literal["source_switch"]
+    targets: list[SourceTargetIn] = Field(
+        min_length=1, description="水源编号与目标运行状态列表（同批编号不得重复）"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+# 按 type 字段判别步骤类型；结构非法（未知类型、缺字段、复供引用缺失等）整体 422
+DrillStepIn = Annotated[
+    DrillIsolationStepIn | DrillRestoreStepIn | DrillSourceSwitchStepIn,
+    Field(discriminator="type"),
+]
+
+
+class DrillIn(BaseModel):
+    """调度演练入参：已读版本 + 一串有序的隔离/复供/水源切换步骤（只读）。
+
+    版本必须等于当前管网版本，否则 409 VERSION_CONFLICT 拒绝演练；
+    空步骤列表只回显当前状态汇总。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    steps: list[DrillStepIn] = Field(
+        default_factory=list,
+        description="有序操作步骤：隔离 / 复供 / 水源切换（空列表只回显当前状态）",
+    )
+
+
 class ReconcileReasonOut(BaseModel):
     code: str
     message: str
@@ -572,3 +644,82 @@ class SnapshotDiffOut(BaseModel):
     source_states: SourceStateDiffOut
     open_faults: SnapshotFaultDiffOut
     supplied_sinks: SuppliedSinksDiffOut
+
+
+# ---------------------------------------------------------------- 调度演练
+
+
+class DrillStepErrorOut(BaseModel):
+    """演练单步失败原因：原因码 + 结构问题明细 / 重新进水风险明细。"""
+
+    code: str
+    message: str
+    issues: list[IssueOut] = []
+    block_reasons: list[ReopenBlockOut] = []
+
+
+class DrillStepOut(BaseModel):
+    """演练单步结果（按步骤类型回显对应字段，其余为 null）。
+
+    ok=true 时 affected_sink_ids / restored_sink_ids 为相对上一步结束状态的
+    新增失供 / 恢复供水用水点；ok=false 时 error 给出失败原因。
+    """
+
+    index: int
+    type: str
+    ok: bool
+    # 隔离步骤：故障管段、拟关阀门、产生的临时事件引用
+    fault_pipe_id: str | None = None
+    close_pipe_ids: list[str] | None = None
+    temp_event_ref: str | None = None
+    # 复供步骤：引用的事件（现存编号或临时引用）与重开的阀门
+    event_id: int | None = None
+    reopened_pipe_ids: list[str] | None = None
+    # 水源切换步骤：目标状态与是否有实际变化
+    targets: list[SourceTargetOut] | None = None
+    changed: bool | None = None
+    # 公共：相对上一步的新增失供 / 恢复供水用水点
+    affected_sink_ids: list[str] = []
+    restored_sink_ids: list[str] = []
+    error: DrillStepErrorOut | None = None
+
+
+class DrillFinalSourceOut(BaseModel):
+    source_id: str
+    running: bool
+
+
+class DrillFinalValveOut(BaseModel):
+    pipe_id: str
+    valve_closed: bool
+
+
+class DrillOpenFaultOut(BaseModel):
+    """最终仍待修复的故障：现存事件给 event_id，演练临时事件给 temp_event_ref。"""
+
+    event_id: int | None = None
+    temp_event_ref: str | None = None
+    fault_pipe_id: str
+
+
+class DrillFinalOut(BaseModel):
+    """全部步骤成功后的最终模拟状态（推演结果，未真实生效）。"""
+
+    sources: list[DrillFinalSourceOut]
+    valves: list[DrillFinalValveOut]
+    open_faults: list[DrillOpenFaultOut]
+    supplied_sink_ids: list[str]
+
+
+class DrillOut(BaseModel):
+    """调度演练只读结果。
+
+    ok=false 时 failed_step_index 为首个失败步骤序号（从 1 起），steps 只包含
+    到该步骤为止的结果，final 为 null；版本过期整体 409 拒绝演练。
+    """
+
+    version: int
+    ok: bool
+    failed_step_index: int | None
+    steps: list[DrillStepOut]
+    final: DrillFinalOut | None

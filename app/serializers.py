@@ -9,6 +9,8 @@ from .planning import (
     DeliveryResult,
     AllocationResult,
     ReconcileResult,
+    DrillResult,
+    DrillStepOutcome,
 )
 
 def serialize_node(node: Node) -> dict:
@@ -181,6 +183,79 @@ def serialize_reconcile(
             for r in result.readings
         ],
         "reasons": [reason.as_dict() for reason in result.reasons],
+    }
+
+
+# ---------------------------------------------------------------- 调度演练
+
+
+def serialize_drill_step(step: DrillStepOutcome) -> dict:
+    error = None
+    if step.error is not None:
+        error = {
+            "code": step.error.code,
+            "message": step.error.message,
+            "issues": [i.as_dict() for i in step.error.issues],
+            "block_reasons": [b.as_dict() for b in step.error.blocks],
+        }
+    return {
+        "index": step.index,
+        "type": step.type,
+        "ok": step.ok,
+        "fault_pipe_id": step.fault_pipe_id,
+        "close_pipe_ids": (
+            list(step.close_pipe_ids) if step.close_pipe_ids is not None else None
+        ),
+        "temp_event_ref": step.temp_event_ref,
+        "event_id": step.event_id,
+        "reopened_pipe_ids": (
+            list(step.reopened_pipe_ids)
+            if step.reopened_pipe_ids is not None
+            else None
+        ),
+        "targets": (
+            [
+                {"source_id": source_id, "running": running}
+                for source_id, running in step.targets
+            ]
+            if step.targets is not None
+            else None
+        ),
+        "changed": step.changed,
+        "affected_sink_ids": list(step.affected_sink_ids),
+        "restored_sink_ids": list(step.restored_sink_ids),
+        "error": error,
+    }
+
+
+def serialize_drill(version: int, result: DrillResult) -> dict:
+    final = None
+    if result.final is not None:
+        final = {
+            "sources": [
+                {"source_id": source_id, "running": running}
+                for source_id, running in result.final.sources
+            ],
+            "valves": [
+                {"pipe_id": pipe_id, "valve_closed": valve_closed}
+                for pipe_id, valve_closed in result.final.valves
+            ],
+            "open_faults": [
+                {
+                    "event_id": event_id,
+                    "temp_event_ref": temp_event_ref,
+                    "fault_pipe_id": fault_pipe_id,
+                }
+                for event_id, temp_event_ref, fault_pipe_id in result.final.open_faults
+            ],
+            "supplied_sink_ids": list(result.final.supplied_sink_ids),
+        }
+    return {
+        "version": version,
+        "ok": result.ok,
+        "failed_step_index": result.failed_step_index,
+        "steps": [serialize_drill_step(s) for s in result.steps],
+        "final": final,
     }
 
 

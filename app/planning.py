@@ -66,6 +66,17 @@
   consistent=false 且不输出补值。
 - 注入、取用、容量均为非负整数；编号覆盖不足/重复/未知节点/非整数或负容量
   整体拒绝（422）；版本过期仍按当前状态计算，仅标记 version_match=false。
+
+调度演练（drill）规则（只读，不改版本/阀位/水源状态/事件/快照）：
+- 调度员携带已读版本与一串有序的隔离、复供、水源切换步骤；以当前状态为起点，
+  在状态副本上逐步套用与既有提交接口完全一致的校验（隔离 for_submit 口径：
+  故障两端须均可隔离、已关闭阀门不得重复关闭；复供与恢复水源不得使任一待修复
+  故障端点重新进水）。
+- 复供步骤可引用现存待修复事件（event_id），或本次演练先前隔离步骤产生的
+  临时事件（temp_event_ref，形如 "T<步骤序号>"，序号从 1 起）。
+- 每步的新增失供/恢复供水用水点均相对上一步结束状态计算。
+- 任一步非法或不安全即停止：记录首个失败步骤与原因，后续步骤不再演练；
+  全部成功才汇总最终运行水源、阀位、待修复故障与通水用水点。
 """
 from __future__ import annotations
 
@@ -127,6 +138,15 @@ STOPPED_SOURCE_INJECTION = "STOPPED_SOURCE_INJECTION"  # 停运水源申报注�
 BLOCKED_PIPE_FLOW = "BLOCKED_PIPE_FLOW"  # 阻断管段（关阀/待修复）读数非 0
 READING_OVER_CAPACITY = "READING_OVER_CAPACITY"  # 读数绝对值超过双向共用容量
 READINGS_INCONSISTENT = "READINGS_INCONSISTENT"  # 节点平衡/容量/停运阻断下无可行解
+
+# 演练步骤失败原因码（与既有单步提交接口的拒绝码一致）
+PLAN_INVALID = "PLAN_INVALID"            # 隔离步骤结构非法（明细在 issues）
+NOT_ISOLATABLE = "NOT_ISOLATABLE"        # 隔离步骤无法隔离故障管段
+EVENT_NOT_FOUND = "EVENT_NOT_FOUND"      # 复供步骤引用的事件不存在
+EVENT_ALREADY_RESTORED = "EVENT_ALREADY_RESTORED"  # 复供步骤引用的事件已复供
+RESTORE_UNSAFE = "RESTORE_UNSAFE"        # 复供步骤存在重新进水风险
+SOURCE_SWITCH_INVALID = "SOURCE_SWITCH_INVALID"  # 水源切换步骤结构非法
+SOURCE_SWITCH_UNSAFE = "SOURCE_SWITCH_UNSAFE"    # 水源切换步骤存在重新进水风险
 
 # 结构性阻断问题（预演会给出，提交据此拒绝）
 BLOCKING_ISSUE_CODES = frozenset(
@@ -1839,6 +1859,361 @@ def reconcile_meters(
         )
 
     return ReconcileResult(consistent=True, readings=ranges, reasons=[])
+
+
+# ---------------------------------------------------------------- 调度演练
+
+# 演练步骤类型
+DRILL_STEP_ISOLATION = "isolation"          # 隔离：故障管段 + 拟关阀门
+DRILL_STEP_RESTORE = "restore"              # 复供：现存事件编号或临时事件引用
+DRILL_STEP_SOURCE_SWITCH = "source_switch"  # 水源切换：一批水源目标运行状态
+
+
+@dataclass
+class DrillStep:
+    """演练单步入参：type 决定有效字段（隔离 / 复供 / 水源切换）。"""
+
+    type: str
+    # 隔离步骤：故障管段 + 拟关阀门
+    fault_pipe_id: str | None = None
+    close_pipe_ids: list[str] = field(default_factory=list)
+    # 复供步骤：现存事件编号 或 本次演练临时事件引用（"T<步骤序号>"），二者必居其一
+    event_id: int | None = None
+    temp_event_ref: str | None = None
+    # 水源切换步骤：(水源编号, 目标运行状态)
+    targets: list[tuple[str, bool]] = field(default_factory=list)
+
+
+@dataclass
+class DrillStepError:
+    """演练单步失败原因：原因码 + 明细（结构问题 issues / 重新进水风险 blocks）。"""
+
+    code: str
+    message: str
+    issues: list[Issue] = field(default_factory=list)
+    # ReopenBlock / SourceSwitchBlock（复供、水源切换的重新进水风险）
+    blocks: list = field(default_factory=list)
+
+
+@dataclass
+class DrillStepOutcome:
+    """演练单步结果。
+
+    ok=True 时给出相对上一步结束状态的新增失供（affected_sink_ids）与
+    恢复供水（restored_sink_ids）用水点；ok=False 时 error 给出首个失败原因。
+    """
+
+    index: int
+    type: str
+    ok: bool
+    affected_sink_ids: list[str] = field(default_factory=list)
+    restored_sink_ids: list[str] = field(default_factory=list)
+    # 隔离步骤回显：故障管段、拟关阀门、产生的临时事件引用
+    fault_pipe_id: str | None = None
+    close_pipe_ids: list[str] | None = None
+    temp_event_ref: str | None = None
+    # 复供步骤回显：引用的事件与重开的阀门
+    event_id: int | None = None
+    reopened_pipe_ids: list[str] | None = None
+    # 水源切换步骤回显：目标状态与是否有实际变化
+    targets: list[tuple[str, bool]] | None = None
+    changed: bool | None = None
+    error: DrillStepError | None = None
+
+
+@dataclass
+class DrillFinalState:
+    """全部步骤成功后的最终模拟状态（推演结果，未真实生效）。"""
+
+    sources: list[tuple[str, bool]]  # (水源编号, 运行状态)，按编号排序
+    valves: list[tuple[str, bool]]   # (管段编号, 阀门是否关闭)，全部有阀管段，按编号排序
+    # (现存事件编号|None, 临时事件引用|None, 故障管段编号)：现存事件按编号升序，
+    # 临时事件按产生步骤序号升序
+    open_faults: list[tuple[int | None, str | None, str]]
+    supplied_sink_ids: list[str]     # 由运行水源可达的用水点（通水用水点）
+
+
+@dataclass
+class DrillResult:
+    """调度演练结果（只读计算，不改任何状态）。
+
+    ok=False 时 failed_step_index 为首个失败步骤序号（从 1 起），steps 只包含
+    到该步骤为止的结果（后续步骤不再演练），final 为 None。
+    """
+
+    ok: bool
+    failed_step_index: int | None
+    steps: list[DrillStepOutcome] = field(default_factory=list)
+    final: DrillFinalState | None = None
+
+
+def simulate_drill(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    real_events: dict[int, dict],
+    steps: list[DrillStep],
+) -> DrillResult:
+    """按顺序只读演练一串隔离/复供/水源切换操作（不改任何真实状态）。
+
+    real_events：现存事件（事件编号 -> 事件 dict，含 fault_pipe_id /
+    closed_pipe_ids / status）；待修复(open)事件的故障管段在通水计算中阻断，
+    已复供(restored)事件仅用于复供步骤的精确报错（EVENT_ALREADY_RESTORED）。
+
+    输入的 nodes/pipes/real_events 不会被修改（全部状态演进发生在内部副本上）。
+    """
+    sim_nodes = dict(nodes)
+    sim_pipes = dict(pipes)
+
+    # 模拟事件表：("id", 现存事件编号) / ("temp", 临时事件引用) -> 事件状态
+    sim_events: dict[tuple[str, object], dict] = {}
+    for event_id, event in real_events.items():
+        sim_events[("id", event_id)] = {
+            "fault_pipe_id": event["fault_pipe_id"],
+            "closed_pipe_ids": list(event["closed_pipe_ids"]),
+            "status": event["status"],
+            "temp_index": None,
+        }
+
+    def pending_fault_pipe_ids() -> frozenset[str]:
+        return frozenset(
+            ev["fault_pipe_id"]
+            for ev in sim_events.values()
+            if ev["status"] == "open"
+        )
+
+    outcomes: list[DrillStepOutcome] = []
+
+    for index, step in enumerate(steps, start=1):
+        outcome: DrillStepOutcome
+        if step.type == DRILL_STEP_ISOLATION:
+            close_ids = list(step.close_pipe_ids)
+            # 与提交接口同一口径：for_submit=True（已关闭阀门不得重复关闭等）
+            plan = evaluate_plan(
+                sim_nodes,
+                sim_pipes,
+                step.fault_pipe_id,
+                close_ids,
+                for_submit=True,
+                pending_fault_pipe_ids=pending_fault_pipe_ids(),
+            )
+            blocking = [i for i in plan.issues if i.code in BLOCKING_ISSUE_CODES]
+            if blocking:
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=False,
+                    fault_pipe_id=step.fault_pipe_id,
+                    close_pipe_ids=close_ids,
+                    error=DrillStepError(
+                        PLAN_INVALID,
+                        "隔离方案非法（管段不存在、无阀管段、重复关闭或把故障管段当作阀门）",
+                        issues=blocking,
+                    ),
+                )
+            elif not plan.isolatable:
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=False,
+                    fault_pipe_id=step.fault_pipe_id,
+                    close_pipe_ids=close_ids,
+                    error=DrillStepError(
+                        NOT_ISOLATABLE,
+                        "该方案无法隔离故障管段：故障管段至少有一端在方案图中仍可从水源到达",
+                        issues=plan.issues,
+                    ),
+                )
+            else:
+                # 应用本步：关闭拟关阀门，登记临时隔离事件（待修复）
+                for pid in dict.fromkeys(close_ids):
+                    p = sim_pipes[pid]
+                    sim_pipes[pid] = Pipe(
+                        p.id, p.from_node, p.to_node, p.has_valve, True, p.name
+                    )
+                temp_ref = f"T{index}"
+                sim_events[("temp", temp_ref)] = {
+                    "fault_pipe_id": step.fault_pipe_id,
+                    "closed_pipe_ids": list(dict.fromkeys(close_ids)),
+                    "status": "open",
+                    "temp_index": index,
+                }
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=True,
+                    fault_pipe_id=step.fault_pipe_id,
+                    close_pipe_ids=close_ids,
+                    temp_event_ref=temp_ref,
+                    affected_sink_ids=plan.affected_sink_ids,
+                    restored_sink_ids=[],
+                )
+        elif step.type == DRILL_STEP_RESTORE:
+            if step.event_id is not None:
+                key: tuple[str, object] = ("id", step.event_id)
+                label = str(step.event_id)
+            else:
+                key = ("temp", step.temp_event_ref)
+                label = str(step.temp_event_ref)
+            event = sim_events.get(key)
+            if event is None:
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=False,
+                    event_id=step.event_id,
+                    temp_event_ref=step.temp_event_ref,
+                    error=DrillStepError(
+                        EVENT_NOT_FOUND, f"隔离事件不存在：{label}"
+                    ),
+                )
+            elif event["status"] != "open":
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=False,
+                    event_id=step.event_id,
+                    temp_event_ref=step.temp_event_ref,
+                    error=DrillStepError(
+                        EVENT_ALREADY_RESTORED,
+                        f"隔离事件 {label} 已复供，不能重复操作",
+                    ),
+                )
+            else:
+                other_faults = frozenset(
+                    ev["fault_pipe_id"]
+                    for k, ev in sim_events.items()
+                    if k != key and ev["status"] == "open"
+                )
+                restore = evaluate_restore(
+                    sim_nodes,
+                    sim_pipes,
+                    reopen_pipe_ids=frozenset(event["closed_pipe_ids"]),
+                    other_fault_pipe_ids=other_faults,
+                )
+                if not restore.safe:
+                    outcome = DrillStepOutcome(
+                        index=index,
+                        type=step.type,
+                        ok=False,
+                        event_id=step.event_id,
+                        temp_event_ref=step.temp_event_ref,
+                        error=DrillStepError(
+                            RESTORE_UNSAFE,
+                            "复供存在重新进水风险：其他待修复故障管段的端点将重新通水",
+                            blocks=restore.blocks,
+                        ),
+                    )
+                else:
+                    # 应用本步：重开该事件阀门（与复供确认同口径），事件置为已复供
+                    for pid in event["closed_pipe_ids"]:
+                        p = sim_pipes.get(pid)
+                        if p is not None and p.has_valve:
+                            sim_pipes[pid] = Pipe(
+                                p.id, p.from_node, p.to_node,
+                                p.has_valve, False, p.name,
+                            )
+                    event["status"] = "restored"
+                    outcome = DrillStepOutcome(
+                        index=index,
+                        type=step.type,
+                        ok=True,
+                        event_id=step.event_id,
+                        temp_event_ref=step.temp_event_ref,
+                        reopened_pipe_ids=list(event["closed_pipe_ids"]),
+                        affected_sink_ids=[],
+                        restored_sink_ids=restore.restored_sink_ids,
+                    )
+        else:  # DRILL_STEP_SOURCE_SWITCH
+            targets = list(step.targets)
+            switch = evaluate_source_switch(
+                sim_nodes,
+                sim_pipes,
+                targets,
+                pending_fault_pipe_ids=pending_fault_pipe_ids(),
+            )
+            if switch.issues:
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=False,
+                    targets=targets,
+                    error=DrillStepError(
+                        SOURCE_SWITCH_INVALID,
+                        "水源切换请求非法（编号不存在、节点不是水源或同批编号重复）",
+                        issues=switch.issues,
+                    ),
+                )
+            elif not switch.safe:
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=False,
+                    targets=targets,
+                    error=DrillStepError(
+                        SOURCE_SWITCH_UNSAFE,
+                        "水源切换存在重新进水风险：恢复水源后待修复故障管段的端点将重新通水",
+                        blocks=switch.blocks,
+                    ),
+                )
+            else:
+                # 应用本步：仅水源运行状态变化（无实际变化时为空操作，状态不变）
+                target_map = dict(targets)
+                sim_nodes = {
+                    nid: Node(
+                        n.id, n.type, n.name, target_map.get(nid, n.running)
+                    )
+                    for nid, n in sim_nodes.items()
+                }
+                outcome = DrillStepOutcome(
+                    index=index,
+                    type=step.type,
+                    ok=True,
+                    targets=targets,
+                    changed=switch.changed,
+                    affected_sink_ids=switch.affected_sink_ids,
+                    restored_sink_ids=switch.restored_sink_ids,
+                )
+        outcomes.append(outcome)
+        if not outcome.ok:
+            # 首个失败步骤：标明原因并停止后续演练，不产出最终状态
+            return DrillResult(
+                ok=False, failed_step_index=index, steps=outcomes, final=None
+            )
+
+    # 全部步骤成功：汇总最终状态（运行水源 / 阀位 / 待修复故障 / 通水用水点）
+    blocked = frozenset(
+        p.id for p in sim_pipes.values() if p.has_valve and p.valve_closed
+    ) | pending_fault_pipe_ids()
+    real_open = sorted(
+        key[1]
+        for key, ev in sim_events.items()
+        if key[0] == "id" and ev["status"] == "open"
+    )
+    temp_open = sorted(
+        (ev["temp_index"], key[1])
+        for key, ev in sim_events.items()
+        if key[0] == "temp" and ev["status"] == "open"
+    )
+    open_faults = [
+        (event_id, None, sim_events[("id", event_id)]["fault_pipe_id"])
+        for event_id in real_open
+    ] + [
+        (None, temp_ref, sim_events[("temp", temp_ref)]["fault_pipe_id"])
+        for _temp_index, temp_ref in temp_open
+    ]
+    final = DrillFinalState(
+        sources=sorted(
+            (nid, n.running) for nid, n in sim_nodes.items() if n.type == "source"
+        ),
+        valves=sorted(
+            (p.id, p.valve_closed) for p in sim_pipes.values() if p.has_valve
+        ),
+        open_faults=open_faults,
+        supplied_sink_ids=reachable_sink_ids(
+            sim_nodes, list(sim_pipes.values()), blocked
+        ),
+    )
+    return DrillResult(ok=True, failed_step_index=None, steps=outcomes, final=final)
 
 
 # ---------------------------------------------------------------- 状态快照
