@@ -524,6 +524,19 @@ def list_events(conn, limit: int) -> list[dict]:
     return [_serialize_event_row(r) for r in rows]
 
 
+def list_all_events(conn) -> list[dict]:
+    """只读：按编号升序返回全部隔离事件（含 open / restored）。
+
+    供有序演练在解析“现存待修复事件”引用时一次性载入；演练本身不写库。
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_EVENT_COLUMNS} FROM isolation_events ORDER BY id ASC"
+        )
+        rows = cur.fetchall()
+    return [_serialize_event_row(r) for r in rows]
+
+
 # ---------------------------------------------------------------- 状态快照
 
 

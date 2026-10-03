@@ -15,6 +15,7 @@
 - POST /api/delivery/evaluate                          用水点最低流量核算（只读：现有阀位/故障下最大可交付总量）
 - POST /api/delivery/allocate                          保障等级分档交付核算（只读：按等级总量、再逐点字典序最大化交付）
 - POST /api/meters/reconcile                           管段流量计读数核对（只读：一致性 + 缺报读数可行流量范围）
+- POST /api/ops/drill                                  有序隔离/复供/水源切换演练（只读：逐步应用既有提交校验，返回逐步结果/临时事件/最终演练态）
 
 状态回看（快照）：
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
@@ -38,6 +39,10 @@ from .planning import (
     evaluate_restore,
     evaluate_source_switch,
     recommend_plan,
+    run_drill_sequence,
+    DrillIsolateStep,
+    DrillRestoreStep,
+    DrillSourceSwitchStep,
     validate_delivery_request,
     validate_reconcile_request,
     reconcile_meters,
@@ -53,6 +58,7 @@ from .schemas import (
     DeliveryEvaluateIn,
     DeliveryAllocateIn,
     MeterReconcileIn,
+    DrillSequenceIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -65,6 +71,7 @@ from .schemas import (
     DeliveryEvaluateOut,
     DeliveryAllocateOut,
     MeterReconcileOut,
+    DrillSequenceOut,
     EventOut,
     SnapshotOut,
     SnapshotMetaOut,
@@ -101,7 +108,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -628,6 +635,73 @@ def reconcile_meter_readings(payload: MeterReconcileIn):
         blocked_pipe_ids=blocked_pipe_ids,
     )
     return serialize_reconcile(version, payload.version, pipes, result)
+
+
+# ---------------------------------------------------------------- 有序操作演练（只读，多步）
+
+
+@app.post(
+    "/api/ops/drill",
+    response_model=DrillSequenceOut,
+    tags=["有序演练"],
+    summary="有序隔离/复供/水源切换演练：逐步应用既有提交校验（只读，不改任何真实状态）",
+)
+def drill_sequence(payload: DrillSequenceIn):
+    # 全程只读：仅用普通连接读取当前管网与现存事件，不开事务、不写库
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        if version != payload.version:
+            # 版本过期：返回当前版本并拒绝演练（不逐步计算），与写接口 409 口径一致
+            raise db.VersionConflict(version, payload.version)
+        seed_events = db.list_all_events(conn)
+
+    drill_steps = []
+    for step in payload.steps:
+        if step.type == "isolate":
+            drill_steps.append(
+                DrillIsolateStep(
+                    fault_pipe_id=step.fault_pipe_id,
+                    close_pipe_ids=list(step.close_pipe_ids),
+                )
+            )
+        elif step.type == "restore":
+            drill_steps.append(
+                DrillRestoreStep(
+                    event_id=step.event_id,
+                    temp_event_step=step.temp_event_step,
+                )
+            )
+        else:  # source_switch
+            drill_steps.append(
+                DrillSourceSwitchStep(
+                    targets=[(t.source_id, t.running) for t in step.targets]
+                )
+            )
+
+    report = run_drill_sequence(
+        nodes,
+        pipes,
+        current_version=version,
+        steps=drill_steps,
+        seed_events=seed_events,
+    )
+
+    return {
+        "version": report.current_version,
+        "version_match": True,
+        "status": "ok" if report.ok else "rejected",
+        "read_only": True,
+        "steps": report.steps,
+        "failure": report.failure,
+        "temp_events": report.temp_events,
+        "final_state": {
+            "version": report.final_version,
+            "running_source_ids": report.final_running_source_ids,
+            "valves": report.final_valves,
+            "open_faults": report.final_open_faults,
+            "supplied_sink_ids": report.final_supplied_sink_ids,
+        },
+    }
 
 
 # ---------------------------------------------------------------- 状态快照回看

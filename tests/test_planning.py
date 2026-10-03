@@ -20,6 +20,10 @@ from app.planning import (  # noqa: E402
     freeze_state,
     reachable_sink_ids,
     recommend_plan,
+    run_drill_sequence,
+    DrillIsolateStep,
+    DrillRestoreStep,
+    DrillSourceSwitchStep,
     validate_delivery_request,
     validate_reconcile_request,
     reconcile_meters,
@@ -1435,6 +1439,352 @@ class ReconcileMetersTests(unittest.TestCase):
         result = reconcile_meters({}, {}, [], [], [])
         self.assertTrue(result.consistent)
         self.assertEqual(result.readings, [])
+
+
+# ---------------------------------------------------------------- 有序演练（只读，多步）
+
+
+def build_drill_restore_demo():
+    """叠加故障演练管网（同 examples/restore_network.json；P4 初始开启、含 U2）：
+
+    S --P1(v)-- A --P2(v)-- B --P4(v)-- D --P6(无阀,故障1)-- U3
+                 |                     |
+               P3(v)                  P7(无阀,故障2)-- E --P8(v)-- U4
+                 |
+                U1（另有 U2 挂在 B 经 P5）
+    """
+    nodes = {
+        "S": Node("S", "source"),
+        "A": Node("A", "junction"),
+        "B": Node("B", "junction"),
+        "D": Node("D", "junction"),
+        "E": Node("E", "junction"),
+        "U1": Node("U1", "sink"),
+        "U2": Node("U2", "sink"),
+        "U3": Node("U3", "sink"),
+        "U4": Node("U4", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S", "A", has_valve=True),
+        "P2": Pipe("P2", "A", "B", has_valve=True),
+        "P3": Pipe("P3", "A", "U1", has_valve=True),
+        "P5": Pipe("P5", "B", "U2", has_valve=True),
+        "P4": Pipe("P4", "B", "D", has_valve=True),
+        "P6": Pipe("P6", "D", "U3", has_valve=False),
+        "P7": Pipe("P7", "D", "E", has_valve=False),
+        "P8": Pipe("P8", "E", "U4", has_valve=True),
+    }
+    return nodes, pipes
+
+
+class DrillSequenceTests(unittest.TestCase):
+    def _run(self, steps, *, nodes=None, pipes=None, version=1, events=None):
+        nodes, pipes = (nodes, pipes) if nodes is not None else build_drill_restore_demo()
+        nodes_in = {k: v for k, v in nodes.items()}
+        pipes_in = {k: v for k, v in pipes.items()}
+        report = run_drill_sequence(
+            nodes_in, pipes_in, version, steps, events or []
+        )
+        # 入参对象不被修改（只读保证）
+        self.assertEqual(nodes_in, nodes)
+        self.assertEqual(pipes_in, pipes)
+        return report
+
+    def test_isolation_then_ordered_restores(self):
+        report = self._run(
+            [
+                DrillIsolateStep("P6", ["P4"]),
+                DrillIsolateStep("P7", []),
+                DrillRestoreStep(temp_event_step=2),
+                DrillRestoreStep(temp_event_step=1),
+            ]
+        )
+        self.assertTrue(report.ok)
+        self.assertEqual([s["status"] for s in report.steps],
+                         ["applied"] * 4)
+        # 演练版本随每个实际操作 +1
+        self.assertEqual([s["version"] for s in report.steps],
+                         [2, 3, 4, 5])
+        # 逐步新增失供：步骤 1 失供 U3/U4；步骤 2/3 无变化；步骤 4 恢复 U3/U4
+        self.assertEqual(report.steps[0]["affected_sink_ids"], ["U3", "U4"])
+        self.assertEqual(report.steps[1]["affected_sink_ids"], [])
+        self.assertEqual(report.steps[3]["restored_sink_ids"], ["U3", "U4"])
+        self.assertEqual(report.final_version, 5)
+        self.assertEqual(report.final_open_faults, [])
+        self.assertEqual(
+            report.final_supplied_sink_ids, ["U1", "U2", "U3", "U4"]
+        )
+        p4 = next(v for v in report.final_valves if v["pipe_id"] == "P4")
+        self.assertFalse(p4["valve_closed"])
+        # 两个临时事件均已复供
+        self.assertEqual([e["temp_event_id"] for e in report.temp_events], [-1, -2])
+        self.assertTrue(all(e["restored"] for e in report.temp_events))
+
+    def test_temp_events_reference_payload(self):
+        report = self._run([DrillIsolateStep("P6", ["P4"])])
+        step = report.steps[0]
+        self.assertEqual(step["temp_event_id"], -1)
+        self.assertEqual(
+            step["event_ref"],
+            {"kind": "temporary", "event_id": -1, "step_index": 1},
+        )
+        self.assertEqual(
+            report.temp_events[0]["fault_pipe_id"], "P6"
+        )
+        self.assertFalse(report.temp_events[0]["restored"])
+
+    def test_restore_inner_event_unsafe_stops_and_leaves_no_trace(self):
+        report = self._run(
+            [
+                DrillIsolateStep("P6", ["P4"]),
+                DrillIsolateStep("P7", []),
+                DrillRestoreStep(temp_event_step=1),  # P7 仍 open -> 风险
+                DrillRestoreStep(temp_event_step=2),  # 不得执行
+            ]
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["step_index"], 3)
+        self.assertEqual(report.failure["code"], "RESTORE_UNSAFE")
+        self.assertEqual(len(report.steps), 3)
+        rejected = report.steps[2]
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(
+            rejected["block_reasons"][0]["pipe_id"], "P7"
+        )
+        self.assertEqual(
+            rejected["block_reasons"][0]["reachable_endpoints"], ["D"]
+        )
+        # 失败步骤的重开不进入最终态：P4 仍关闭，P6/P7 仍待修复，版本停在 3
+        p4 = next(v for v in report.final_valves if v["pipe_id"] == "P4")
+        self.assertTrue(p4["valve_closed"])
+        self.assertEqual(
+            sorted(f["fault_pipe_id"] for f in report.final_open_faults),
+            ["P6", "P7"],
+        )
+        self.assertEqual(report.final_version, 3)
+        # 临时事件列表仍列出前两步（未复供）
+        self.assertEqual(
+            [e["restored"] for e in report.temp_events], [False, False]
+        )
+
+    def test_isolation_not_isolatable(self):
+        report = self._run([DrillIsolateStep("P6", ["P5"])])
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["step_index"], 1)
+        self.assertEqual(report.failure["code"], "NOT_ISOLATABLE")
+        # 未应用：阀位/版本/故障均不变
+        self.assertFalse(
+            next(v for v in report.final_valves if v["pipe_id"] == "P5")["valve_closed"]
+        )
+        self.assertEqual(report.final_open_faults, [])
+        self.assertEqual(report.final_version, 1)
+
+    def test_isolation_invalid_uses_submit_rules(self):
+        # 已关闭阀门重复关闭：先关 P4 再关 P4
+        report = self._run(
+            [
+                DrillIsolateStep("P6", ["P4"]),
+                DrillIsolateStep("P7", ["P4"]),
+            ]
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["step_index"], 2)
+        self.assertEqual(report.failure["code"], "PLAN_INVALID")
+        self.assertEqual(
+            report.failure["issues"][0]["code"], CLOSE_PIPE_DUPLICATE
+        )
+
+        # 故障管段不存在 / 无阀管段 / 故障管段自身
+        for step, code in [
+            (DrillIsolateStep("PX", []), FAULT_PIPE_NOT_FOUND),
+            (DrillIsolateStep("P6", ["P6"]), CLOSE_PIPE_IS_FAULT),
+            (DrillIsolateStep("P1", ["P6"]), CLOSE_PIPE_NO_VALVE),
+            (DrillIsolateStep("P1", ["PX"]), CLOSE_PIPE_NOT_FOUND),
+        ]:
+            report = self._run([step])
+            self.assertFalse(report.ok, step)
+            self.assertEqual(report.failure["code"], "PLAN_INVALID")
+            self.assertEqual(report.failure["issues"][0]["code"], code)
+
+    def test_restore_existing_event(self):
+        nodes, pipes = build_restore_demo()
+        seed = [
+            {
+                "id": 7,
+                "status": "open",
+                "fault_pipe_id": "P6",
+                "closed_pipe_ids": ["P4"],
+            }
+        ]
+        # 现存 open 事件且无其他 open 故障：复供安全
+        report = self._run(
+            [DrillRestoreStep(event_id=7)],
+            nodes=nodes, pipes=pipes, version=2, events=seed,
+        )
+        self.assertTrue(report.ok)
+        self.assertEqual(report.steps[0]["event_ref"],
+                         {"kind": "existing", "event_id": 7})
+        self.assertEqual(report.steps[0]["reopen_pipe_ids"], ["P4"])
+        self.assertEqual(report.final_open_faults, [])
+
+    def test_restore_existing_event_not_found_or_restored(self):
+        nodes, pipes = build_restore_demo()
+        seed = [
+            {"id": 1, "status": "restored",
+             "fault_pipe_id": "P6", "closed_pipe_ids": ["P4"]}
+        ]
+        report = self._run(
+            [DrillRestoreStep(event_id=9)],
+            nodes=nodes, pipes=pipes, events=seed,
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["code"], "EVENT_NOT_FOUND")
+
+        report = self._run(
+            [DrillRestoreStep(event_id=1)],
+            nodes=nodes, pipes=pipes, events=seed,
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["code"], "EVENT_ALREADY_RESTORED")
+
+    def test_restore_existing_unsafe_due_to_other_seed_fault(self):
+        nodes, pipes = build_restore_demo()
+        # 真实态：P4 已关、事件 1(P6) 与事件 2(P7) 都 open
+        pipes["P4"] = Pipe("P4", "B", "D", has_valve=True, valve_closed=True)
+        seed = [
+            {"id": 1, "status": "open", "fault_pipe_id": "P6",
+             "closed_pipe_ids": ["P4"]},
+            {"id": 2, "status": "open", "fault_pipe_id": "P7",
+             "closed_pipe_ids": []},
+        ]
+        report = self._run(
+            [DrillRestoreStep(event_id=1)], nodes=nodes, pipes=pipes,
+            version=3, events=seed,
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["code"], "RESTORE_UNSAFE")
+        self.assertEqual(
+            report.failure["issues"][0]["pipe_id"], "P7"
+        )
+        # 未应用：真实阀位入参保持，且最终态 P4 仍关闭
+        self.assertTrue(
+            next(v for v in report.final_valves if v["pipe_id"] == "P4")["valve_closed"]
+        )
+
+    def test_temp_ref_unknown_and_double_restore(self):
+        # 引用不存在的隔离步骤
+        report = self._run([DrillRestoreStep(temp_event_step=3)])
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["code"], "TEMP_EVENT_NOT_FOUND")
+
+        # 同一临时事件演练内重复复供
+        report = self._run(
+            [
+                DrillIsolateStep("P6", ["P4"]),
+                DrillRestoreStep(temp_event_step=1),
+                DrillRestoreStep(temp_event_step=1),
+            ]
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["step_index"], 3)
+        self.assertEqual(report.failure["code"], "EVENT_ALREADY_RESTORED")
+
+    def test_source_switch_safe_unsafe_and_noop_version(self):
+        nodes, pipes = build_two_source_demo()
+        # S2 已停运；Q1 关闭隔离 Q2（S2 停运时可行）
+        nodes["S2"] = Node("S2", "source", running=False)
+        pipes["Q1"] = Pipe("Q1", "S1", "C", has_valve=True, valve_closed=True)
+        seed = [{"id": 1, "status": "open", "fault_pipe_id": "Q2",
+                 "closed_pipe_ids": ["Q1"]}]
+
+        # 恢复 S2：Q2 的 C 端经 Q3 重新进水，不安全
+        report = self._run(
+            [DrillSourceSwitchStep([("S2", True)])],
+            nodes=nodes, pipes=pipes, version=3, events=seed,
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(report.failure["code"], "SOURCE_SWITCH_UNSAFE")
+        self.assertEqual(
+            report.failure["issues"][0]["reachable_endpoints"], ["C"]
+        )
+        # 失败不应用：S2 仍停运、版本不推进
+        self.assertEqual(report.final_running_source_ids, ["S1"])
+        self.assertEqual(report.final_version, 3)
+
+        # 停运 S1：只收缩可达，安全（changed=True 推进版本）
+        report = self._run(
+            [DrillSourceSwitchStep([("S1", False)])],
+            nodes=nodes, pipes=pipes, version=3, events=seed,
+        )
+        self.assertTrue(report.ok)
+        self.assertTrue(report.steps[0]["changed"])
+        self.assertEqual(report.final_version, 4)
+
+        # 空切换：changed=False，安全且版本不推进
+        report = self._run(
+            [DrillSourceSwitchStep([("S1", True)])],
+            nodes=nodes, pipes=pipes, version=3, events=seed,
+        )
+        self.assertTrue(report.ok)
+        self.assertFalse(report.steps[0]["changed"])
+        self.assertEqual(report.steps[0]["version"], 3)
+        self.assertEqual(report.final_version, 3)
+
+    def test_source_switch_invalid(self):
+        for targets, code in [
+            ([("X", True)], SOURCE_NOT_FOUND),
+            ([("U1", False)], SOURCE_NOT_SWITCHABLE),
+        ]:
+            nodes, pipes = build_two_source_demo()
+            report = self._run(
+                [DrillSourceSwitchStep(targets)], nodes=nodes, pipes=pipes,
+            )
+            self.assertFalse(report.ok)
+            self.assertEqual(report.failure["code"], "SOURCE_SWITCH_INVALID")
+            self.assertEqual(report.failure["issues"][0]["code"], code)
+
+        # 同批重复
+        nodes, pipes = build_two_source_demo()
+        report = self._run(
+            [DrillSourceSwitchStep([("S1", False), ("S1", True)])],
+            nodes=nodes, pipes=pipes,
+        )
+        self.assertFalse(report.ok)
+        self.assertEqual(
+            report.failure["issues"][0]["code"], SOURCE_TARGET_DUPLICATE
+        )
+
+    def test_mixed_sequence_per_step_delta_relative_to_previous(self):
+        nodes, pipes = build_two_source_demo()
+        report = self._run(
+            [
+                DrillSourceSwitchStep([("S1", False)]),    # S2 顶供：无失供
+                DrillSourceSwitchStep([("S2", False)]),    # 全网无水源：U1/U2 失供
+                DrillSourceSwitchStep([("S2", True)]),     # S2 恢复：U1/U2 恢复
+            ],
+            nodes=nodes, pipes=pipes,
+        )
+        self.assertTrue(report.ok)
+        self.assertEqual(report.steps[0]["affected_sink_ids"], [])
+        self.assertEqual(
+            report.steps[1]["affected_sink_ids"], ["U1", "U2"]
+        )
+        self.assertEqual(
+            report.steps[2]["restored_sink_ids"], ["U1", "U2"]
+        )
+        # 步骤 1、2 推进版本，步骤 3 恢复 S2 也推进
+        self.assertEqual([s["version"] for s in report.steps], [2, 3, 4])
+        self.assertEqual(report.final_running_source_ids, ["S2"])
+
+    def test_final_state_supplied_sinks_initial_baseline(self):
+        nodes, pipes = build_drill_restore_demo()
+        report = run_drill_sequence(nodes, pipes, 1, [], [])
+        self.assertTrue(report.ok)
+        self.assertEqual(report.steps, [])
+        self.assertEqual(
+            report.final_supplied_sink_ids, ["U1", "U2", "U3", "U4"]
+        )
+        self.assertEqual(report.final_version, 1)
 
 
 if __name__ == "__main__":

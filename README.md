@@ -17,9 +17,15 @@
 供水不足时还可携带各用水点的**保障等级**（数字越小越优先），**只读核算分档交付**：
 先按等级依次最大化该等级交付总量，再在各等级总量最优条件下按（等级、用水点编号）
 逐点最大化交付量，返回各点交付与缺口，结果由一组同时可行的整数流量实现。
+调度员还可把一串有序的**隔离、复供、水源切换**操作交给 **`POST /api/ops/drill`**
+做**执行前演练**：以已读管网版本与当前状态为起点，在服务内存中逐步套用既有提交校验
+（故障两端须隔离；复供、恢复水源不得使任一待修复故障端点重新进水），逐步给出
+新增失供 / 恢复供水点（相对上一步计算）、本次隔离产生的**临时事件引用**，
+以及最终演练态的运行水源、阀位、待修复故障与通水用水点；版本过期即拒绝演练，
+任一步非法或不安全标明首个失败步骤并停止后续，全程只读，不产生任何真实变更。
 
 > 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、
-> 流量核算、分档交付）只以**运行中**的水源为供水起点；停运水源不再供水。
+> 流量核算、分档交付、有序演练）只以**运行中**的水源为供水起点；停运水源不再供水。
 
 ---
 
@@ -259,6 +265,51 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
   显式 `base_id` 必须与目标快照**相邻**，否则 `422 SNAPSHOT_NOT_ADJACENT`；
   未知快照编号统一 `404 SNAPSHOT_NOT_FOUND`，绝不静默返回当前状态。
 
+**有序隔离 / 复供 / 水源切换演练**（`POST /api/ops/drill`，**只读**，
+不改真实版本、阀位、水源状态、事件与快照；与各单步接口并存、互不影响）：
+
+- 入参为已读 `version` + 一串**有序步骤**，每步以 `type` 区分：
+  - `{"type":"isolate","fault_pipe_id","close_pipe_ids":[...]}` 隔离：
+    语义与既有 `POST /api/isolation/submit` 的提交校验完全一致
+    （故障/拟关管段存在、拟关管段带阀、不重复、不含故障管段本身、
+    **已关阀门不得重复关闭**、故障两端在方案图中均不可由运行水源到达）；
+  - `{"type":"restore", ...}` 复供：**恰好**给 `event_id`
+    （现存待修复事件编号）或 `temp_event_step`（本次先前隔离步骤的**序号**，
+    从 1 开始）之一；复供安全性沿用既有确认接口——重开该事件阀门后，
+    其余每条待修复故障管段两端仍须不可达；
+  - `{"type":"source_switch","targets":[{"source_id","running"}]}` 水源切换：
+    校验（仅水源可切换、同批不重复）与安全口径
+    （恢复后任一待修复故障端点重新进水即不安全）与既有确认接口一致；
+    全部目标状态已满足时 `changed=false`、**演练版本不推进**。
+- 演练以**当前真实状态**（含现存 open / restored 事件、阀位、水源运行状态）
+  为起点，在服务内存复制的演练态上按顺序执行；本次隔离成功产生的事件为
+  **临时事件**，编号取**负整数**（-1、-2……），与真实正整数事件不冲突，
+  演练结束即失效，绝不写库；隔离步骤结果中以
+  `event_ref = {"kind":"temporary","event_id":-1,"step_index":1}` 给出引用，
+  后续复供步骤用 `temp_event_step` 引用它。
+- 每步返回 `status`（`applied` / `rejected`）、应用后的演练 `version`
+  （每个实际改变状态的步骤 +1，空切换不 +1），以及**相对上一步应用后演练态**
+  计算的 `affected_sink_ids`（新增失供）与 `restored_sink_ids`（恢复供水）。
+- **任一步骤非法或不安全即停止**：该步 `status="rejected"` 且为结果中最后一步，
+  后续步骤不再演练；顶层 `failure` 标明首个失败步骤序号 `step_index`、
+  原因码与明细（`PLAN_INVALID` / `NOT_ISOLATABLE` / `EVENT_NOT_FOUND` /
+  `EVENT_ALREADY_RESTORED` / `TEMP_EVENT_NOT_FOUND` / `RESTORE_UNSAFE` /
+  `SOURCE_SWITCH_INVALID` / `SOURCE_SWITCH_UNSAFE`）；
+  失败步骤的任何变更**不进入**最终演练态。
+- **版本过期**（`version` ≠ 当前版本）直接 `409 VERSION_CONFLICT`
+  返回 `current_version` 并**拒绝整串演练**（不逐步计算，与写接口同口径）；
+  请求结构非法（未知步骤类型、复供同时/都不给两个引用、空步骤列表等）由
+  请求模型统一 `422` 拒绝。
+- 响应给出 `status`（`ok` / `rejected`）、逐步结果 `steps`、
+  本次全部临时事件 `temp_events`（含是否已在演练内复供 `restored`）、
+  以及 `final_state`：演练结束（失败时为最后一次成功应用后）的演练版本、
+  运行水源 `running_source_ids`、**全部有阀管段**阀位 `valves`、
+  待修复故障 `open_faults`（`temporary` 区分临时/现存事件）、
+  与由运行水源可达的用水点 `supplied_sink_ids`。
+- `read_only` 恒为 `true`：接口只用只读连接读取当前管网与现存事件，
+  不开写事务、不产生快照；演练内的隔离/复供/切换**不会**改变
+  真实阀位、水源状态、事件与版本。既有各单步接口的输入输出契约保持不变。
+
 ## 五、HTTP API
 
 | 方法 | 路径 | 说明 |
@@ -277,6 +328,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 | POST | `/api/delivery/evaluate` | 用水点最低流量核算（只读：现有阀位/故障下的最大可交付总量，整数最大流） |
 | POST | `/api/delivery/allocate` | 保障等级分档交付（只读：先按等级总量、再按等级/编号逐点最大化各点交付与缺口） |
 | POST | `/api/meters/reconcile` | 管段流量计读数核对（只读：一致性校验 + 缺报管段可行流量最小/最大值，整数有界可行流） |
+| POST | `/api/ops/drill` | 有序隔离/复供/水源切换演练（只读：逐步应用既有提交校验，返回逐步结果/临时事件/最终演练态） |
 | GET | `/api/snapshots` | 状态快照列表（编号升序，`limit` / `after_id` 游标分页） |
 | GET | `/api/snapshots/{snapshot_id}` | 按编号读取冻结快照（节点/水源运行状态/管段阀位/待修复故障/可达用水点） |
 | GET | `/api/snapshots/{snapshot_id}/diff?base_id=` | 相邻快照六类净变化对照（缺省对照上一条；首条无基线全计为新增） |
@@ -1048,6 +1100,127 @@ python3 examples/meter_reconcile_demo.py http://localhost:8000
 编号未覆盖/重复/未知节点与类型错误的 422 拒绝 → 确认版本、阀位、水源状态与事件
 全程未被改写。
 
+### 14. 有序隔离 / 复供 / 水源切换演练（执行前只读预演）
+
+调度员执行前，可把一串有序操作一次性交给 `POST /api/ops/drill`：
+服务以已读版本与**当前真实状态**为起点，在内存中逐步应用与各**确认/提交**接口
+完全相同的校验，返回逐步结果、临时事件引用与最终演练态；**全程只读**，
+真实版本、阀位、水源状态、事件、快照均不变。
+
+```bash
+curl -s -X POST http://localhost:8000/api/ops/drill \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version": 1,
+    "steps": [
+      {"type": "isolate", "fault_pipe_id": "P6", "close_pipe_ids": ["P4"]},
+      {"type": "isolate", "fault_pipe_id": "P7", "close_pipe_ids": []},
+      {"type": "restore", "temp_event_step": 2},
+      {"type": "restore", "temp_event_step": 1}
+    ]
+  }'
+```
+
+复供步骤两种引用（恰好给一个）：
+
+```json
+{"type": "restore", "event_id": 3}
+{"type": "restore", "temp_event_step": 1}
+```
+
+- `event_id`：现存隔离事件（`GET /api/isolation/events` 中的真实编号）；
+- `temp_event_step`：本次演练中先前某条**隔离步骤的序号**（从 1 开始），
+  引用该步成功后产生的临时事件。
+
+成功演练（叠加故障 P6/P7：先隔离外层 P6 关 P4、再空方案隔离区内 P7，
+然后先复供区内事件、再复供外层事件）响应（节选）：
+
+```json
+{
+  "version": 1,
+  "version_match": true,
+  "status": "ok",
+  "read_only": true,
+  "steps": [
+    {"index": 1, "type": "isolate", "status": "applied", "version": 2,
+     "fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "isolatable": true,
+     "affected_sink_ids": ["U3", "U4"], "restored_sink_ids": [],
+     "temp_event_id": -1,
+     "event_ref": {"kind": "temporary", "event_id": -1, "step_index": 1}},
+    {"index": 2, "type": "isolate", "status": "applied", "version": 3,
+     "fault_pipe_id": "P7", "close_pipe_ids": [], "isolatable": true,
+     "affected_sink_ids": [], "restored_sink_ids": [],
+     "temp_event_id": -2,
+     "event_ref": {"kind": "temporary", "event_id": -2, "step_index": 2}},
+    {"index": 3, "type": "restore", "status": "applied", "version": 4,
+     "event_ref": {"kind": "temporary", "event_id": -2, "step_index": 2},
+     "affected_sink_ids": [], "restored_sink_ids": []},
+    {"index": 4, "type": "restore", "status": "applied", "version": 5,
+     "event_ref": {"kind": "temporary", "event_id": -1, "step_index": 1},
+     "affected_sink_ids": [], "restored_sink_ids": ["U3", "U4"]}
+  ],
+  "failure": null,
+  "temp_events": [
+    {"temp_event_id": -1, "step_index": 1, "fault_pipe_id": "P6",
+     "closed_pipe_ids": ["P4"], "restored": true},
+    {"temp_event_id": -2, "step_index": 2, "fault_pipe_id": "P7",
+     "closed_pipe_ids": [], "restored": true}
+  ],
+  "final_state": {
+    "version": 5,
+    "running_source_ids": ["S"],
+    "valves": [
+      {"pipe_id": "P1", "has_valve": true, "valve_closed": false},
+      {"pipe_id": "P4", "has_valve": true, "valve_closed": false}
+    ],
+    "open_faults": [],
+    "supplied_sink_ids": ["U1", "U3", "U4"]
+  }
+}
+```
+
+本轮用法要点：
+
+- **逐步增量**：每步的 `affected_sink_ids`（新增失供）/ `restored_sink_ids`
+  （恢复供水）都相对**上一步应用后**的演练态计算，不是相对演练起点；
+  每个实际改变状态的步骤使演练 `version` +1，水源目标状态全部已满足
+  （`changed=false`）时不推进。
+- **临时事件**：本次隔离步骤成功即生成负整数编号的临时事件
+  （`-1`、`-2`……，仅本次演练有效，绝不写库），用 `temp_event_step`
+  按步骤序号引用；响应顶层 `temp_events` 列出全部临时事件及演练内是否已复供。
+- **失败即停**：把上例第 3 步换成先复供外层事件
+  （`{"type":"restore","temp_event_step":1}`），待修复故障 P7 的 `D` 端将
+  重新进水：`status="rejected"`，`failure.step_index=3`、
+  `code="RESTORE_UNSAFE"`（`issues` 含故障管段与 `reachable_endpoints`），
+  结果只含前 3 步且第 4 步不再演练；`final_state` 停在第 2 步应用后
+  （P4 仍关闭、P6/P7 仍待修复、演练版本 3），失败步骤不留痕。
+- **版本过期拒绝整串演练**：`version` 与当前不一致时直接
+  `409 VERSION_CONFLICT` 并回 `current_version`，不逐步计算；取到新版本后
+  重新发起即可。
+- **复供引用错误**：现存事件不存在 `EVENT_NOT_FOUND`、现存事件已复供
+  `EVENT_ALREADY_RESTORED`、临时步骤尚未成功隔离 `TEMP_EVENT_NOT_FOUND`、
+  同一临时事件演练内重复复供 `EVENT_ALREADY_RESTORED`。
+- **混排水源切换**：隔离 / 复供 / 水源切换可任意有序混排，彼此通过演练态的
+  阀位、水源运行状态与待修复故障联动；恢复停运水源导致任一待修复故障端点
+  重新进水时该步 `SOURCE_SWITCH_UNSAFE` 并停止；允许演练到全网无运行水源
+  （所有用水点新增失供，不额外报错）。
+- **只读保证**：`read_only` 恒为 true，不产生快照；演练后 `GET /api/network`、
+  `/api/isolation/events`、`/api/snapshots` 与演练前一致。原单步预演/提交/
+  确认接口契约均未改动。
+
+有序演练全流程演示脚本（标准库实现，全程只读）：
+
+```bash
+python3 examples/drill_demo.py
+# 或指定地址：
+python3 examples/drill_demo.py http://localhost:8000
+```
+
+脚本依次演示：成功有序演练（隔离×2 → 按序复供临时事件）→ 真实状态只读核对 →
+复供顺序不安全首个失败即停（最终态不含失败步骤）→ 版本过期 409 →
+临时事件引用不存在 → 引用现存事件编号复供（真实事件仍 open）→
+复供与水源切换混排。
+
 ### 一键完整演示脚本（标准库实现，无需安装依赖）
 
 ```bash
@@ -1074,15 +1247,24 @@ python3 examples/source_switch_demo.py
 python3 examples/source_switch_demo.py http://localhost:8000
 ```
 
+有序演练流程（隔离×2 → 按序复供临时事件 → 顺序不安全首个失败即停 → 版本过期 →
+现存事件引用 → 复供与水源切换混排；全程只读）：
+
+```bash
+python3 examples/drill_demo.py
+# 或指定地址：
+python3 examples/drill_demo.py http://localhost:8000
+```
+
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，90 个用例）不依赖数据库与第三方库，可直接用标准库运行：
+核心图算法与校验逻辑（`tests/test_planning.py`，103 个用例，含 13 个有序演练领域用例）不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
 python3 -m unittest tests.test_planning -v
 ```
 
-路由层集成测试（`tests/test_api.py`，92 个用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
+路由层集成测试（`tests/test_api.py`，103 个用例，含 11 个有序演练接口用例）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**有序演练（逐步应用/临时事件/现存事件/失供恢复增量/安全拒绝/版本过期/422/全程只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖），需先安装依赖：
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1095,10 +1277,10 @@ python3 -m unittest discover -s tests -v
 app/
   config.py       # 环境变量配置
   schemas.py      # Pydantic 请求/响应模型
-  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、状态快照冻结与相邻对照
+  planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、读数核对(校验+整数有界可行流+缺报流量范围)、状态快照冻结与相邻对照、有序演练(内存中逐步应用隔离/复供/水源切换的既有提交校验+临时事件)
   db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、状态快照写入/读取、旧库上线基线、历史
   serializers.py  # 响应序列化
-  main.py         # FastAPI 路由与错误处理
+  main.py         # FastAPI 路由与错误处理（含 POST /api/ops/drill 有序演练）
 examples/
   sample_network.json     # 隔离演示管网
   restore_network.json    # 复供演示管网（叠加故障）
@@ -1110,6 +1292,7 @@ examples/
   delivery_demo.py        # 用水点最低流量核算全流程示例（只读：水源/管段上限、瓶颈、停运/关阀阻断）
   allocate_demo.py        # 保障等级分档交付全流程示例（只读：等级总量优先、同等级编号序、缺口、阻断口径、422）
   meter_reconcile_demo.py # 管段流量计读数核对全流程示例（只读：一致性、缺报范围、停运/关阀/故障硬约束、422）
+  drill_demo.py           # 有序隔离/复供/水源切换演练全流程示例（只读：逐步校验、临时事件、失败即停、版本过期、混排）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
 tests/
   test_planning.py

@@ -174,6 +174,11 @@ def fake_list_events(conn, limit):
     return list(reversed(STORE.events))[:limit]
 
 
+def fake_list_all_events(conn):
+    # 与 db.list_all_events 一致：按事件编号升序，含 open/restored
+    return list(STORE.events)
+
+
 def fake_get_event(conn, event_id, for_update=False):
     for e in STORE.events:
         if e["id"] == event_id:
@@ -263,6 +268,7 @@ db.load_snapshot = fake_load_snapshot
 db.replace_network = fake_replace_network
 db.submit_isolation = fake_submit_isolation
 db.list_events = fake_list_events
+db.list_all_events = fake_list_all_events
 db.get_event = fake_get_event
 db.list_open_events = fake_list_open_events
 db.confirm_restore = fake_confirm_restore
@@ -2373,6 +2379,319 @@ class MeterReconcileApiTests(unittest.TestCase):
         net = self.client.get("/api/network").json()
         self.assertEqual(net["version"], 1)
         self.assertEqual(self.client.get("/api/isolation/events").json(), [])
+
+
+class DrillSequenceApiTests(unittest.TestCase):
+    """POST /api/ops/drill：有序隔离/复供/水源切换演练（只读）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    def setUp(self):
+        STORE.version = 0
+        STORE.nodes = {}
+        STORE.pipes = {}
+        STORE.events = []
+        STORE.next_event_id = 1
+        STORE.snapshots = []
+        STORE.next_snapshot_id = 1
+        STORE.fail_commit = False
+
+    def _import(self, network=RESTORE_NETWORK):
+        r = self.client.post("/api/network/import", json=network)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def _drill(self, body):
+        return self.client.post("/api/ops/drill", json=body)
+
+    def test_version_conflict_rejects_drill_with_current_version(self):
+        self._import()
+        r = self._drill(
+            {"version": 99,
+             "steps": [{"type": "isolate", "fault_pipe_id": "P6",
+                        "close_pipe_ids": ["P4"]}]}
+        )
+        self.assertEqual(r.status_code, 409)
+        err = r.json()["error"]
+        self.assertEqual(err["code"], "VERSION_CONFLICT")
+        self.assertEqual(err["current_version"], 1)
+        self.assertEqual(err["expected_version"], 99)
+        # 拒绝演练：无步骤输出，真实状态不变
+        self.assertEqual(self.client.get("/api/network").json()["version"], 1)
+
+    def test_full_temporary_event_lifecycle(self):
+        self._import()
+        body = {
+            "version": 1,
+            "steps": [
+                {"type": "isolate", "fault_pipe_id": "P6",
+                 "close_pipe_ids": ["P4"]},
+                {"type": "isolate", "fault_pipe_id": "P7",
+                 "close_pipe_ids": []},
+                {"type": "restore", "temp_event_step": 2},
+                {"type": "restore", "temp_event_step": 1},
+            ],
+        }
+        r = self._drill(body)
+        self.assertEqual(r.status_code, 200, r.text)
+        out = r.json()
+        self.assertEqual(out["status"], "ok")
+        self.assertIsNone(out["failure"])
+        self.assertTrue(out["read_only"])
+        self.assertTrue(out["version_match"])
+        self.assertEqual([s["status"] for s in out["steps"]], ["applied"] * 4)
+        self.assertEqual([s["version"] for s in out["steps"]], [2, 3, 4, 5])
+        # 逐步增量：步骤 1 新增失供 U3/U4；步骤 4 恢复 U3/U4
+        self.assertEqual(out["steps"][0]["affected_sink_ids"], ["U3", "U4"])
+        self.assertEqual(out["steps"][3]["restored_sink_ids"], ["U3", "U4"])
+        # 临时事件引用（负整数编号，与真实正整数事件不冲突）
+        self.assertEqual([t["temp_event_id"] for t in out["temp_events"]], [-1, -2])
+        self.assertEqual(out["steps"][0]["event_ref"],
+                         {"kind": "temporary", "event_id": -1, "step_index": 1})
+        self.assertTrue(all(t["restored"] for t in out["temp_events"]))
+        # 最终演练态：阀位全开、无待修复故障、全部用水点通水
+        fs = out["final_state"]
+        self.assertEqual(fs["version"], 5)
+        self.assertEqual(fs["running_source_ids"], ["S"])
+        self.assertTrue(all(not v["valve_closed"] for v in fs["valves"]))
+        self.assertEqual(fs["open_faults"], [])
+        self.assertEqual(fs["supplied_sink_ids"], ["U1", "U2", "U3", "U4"])
+
+    def test_drill_is_readonly_against_real_state(self):
+        self._import()
+        self._drill({
+            "version": 1,
+            "steps": [
+                {"type": "isolate", "fault_pipe_id": "P6",
+                 "close_pipe_ids": ["P4"]},
+                {"type": "isolate", "fault_pipe_id": "P7", "close_pipe_ids": []},
+            ],
+        })
+        # 真实版本/阀位/事件/快照均不变
+        net = self.client.get("/api/network").json()
+        self.assertEqual(net["version"], 1)
+        self.assertFalse(
+            next(p for p in net["pipes"] if p["id"] == "P4")["valve_closed"]
+        )
+        self.assertEqual(self.client.get("/api/isolation/events").json(), [])
+        snaps = self.client.get("/api/snapshots").json()
+        self.assertEqual([s["op_type"] for s in snaps], ["network_import"])
+
+    def test_restore_unsafe_stops_at_first_failure(self):
+        self._import()
+        out = self._drill({
+            "version": 1,
+            "steps": [
+                {"type": "isolate", "fault_pipe_id": "P6",
+                 "close_pipe_ids": ["P4"]},
+                {"type": "isolate", "fault_pipe_id": "P7", "close_pipe_ids": []},
+                {"type": "restore", "temp_event_step": 1},
+                {"type": "isolate", "fault_pipe_id": "P8", "close_pipe_ids": []},
+            ],
+        }).json()
+        self.assertEqual(out["status"], "rejected")
+        self.assertEqual(out["failure"]["step_index"], 3)
+        self.assertEqual(out["failure"]["code"], "RESTORE_UNSAFE")
+        # 仅 3 步输出：失败步骤为最后一步，第 4 步不演练
+        self.assertEqual(len(out["steps"]), 3)
+        rejected = out["steps"][2]
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(rejected["block_reasons"][0]["code"], "FAULT_REWATER_RISK")
+        self.assertEqual(rejected["block_reasons"][0]["pipe_id"], "P7")
+        self.assertEqual(
+            rejected["block_reasons"][0]["reachable_endpoints"], ["D"]
+        )
+        # 失败不留痕：最终态停在步骤 2 应用后（P4 关、两条临时故障待修复、版本 3）
+        fs = out["final_state"]
+        self.assertEqual(fs["version"], 3)
+        self.assertTrue(next(v for v in fs["valves"]
+                             if v["pipe_id"] == "P4")["valve_closed"])
+        self.assertEqual(
+            sorted(f["fault_pipe_id"] for f in fs["open_faults"]),
+            ["P6", "P7"],
+        )
+        self.assertTrue(all(f["temporary"] for f in fs["open_faults"]))
+
+    def test_isolation_failures(self):
+        self._import()
+        # 不可隔离
+        out = self._drill({
+            "version": 1,
+            "steps": [{"type": "isolate", "fault_pipe_id": "P6",
+                       "close_pipe_ids": ["P5"]}],
+        }).json()
+        self.assertEqual(out["status"], "rejected")
+        self.assertEqual(out["failure"]["step_index"], 1)
+        self.assertEqual(out["failure"]["code"], "NOT_ISOLATABLE")
+
+        # 结构非法（故障管段不存在）：issues 明细沿用单步提交契约
+        out = self._drill({
+            "version": 1,
+            "steps": [{"type": "isolate", "fault_pipe_id": "PX",
+                       "close_pipe_ids": []}],
+        }).json()
+        self.assertEqual(out["failure"]["code"], "PLAN_INVALID")
+        self.assertEqual(out["failure"]["issues"][0]["code"], "FAULT_PIPE_NOT_FOUND")
+
+    def test_restore_existing_event_refs(self):
+        self._import()
+        # 真实提交一条隔离事件（事件 1，关 P4）
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+
+        # 演练内复供现存事件：安全（无其他 open 故障）
+        out = self._drill({
+            "version": 2,
+            "steps": [{"type": "restore", "event_id": 1}],
+        }).json()
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["steps"][0]["event_ref"],
+                         {"kind": "existing", "event_id": 1, "step_index": None})
+        self.assertEqual(out["steps"][0]["reopen_pipe_ids"], ["P4"])
+        self.assertEqual(out["steps"][0]["restored_sink_ids"], ["U3", "U4"])
+        # 真实事件仍 open（演练只读）
+        self.assertEqual(
+            self.client.get("/api/isolation/events").json()[0]["status"], "open"
+        )
+
+        # 引用不存在事件
+        out = self._drill({
+            "version": 2,
+            "steps": [{"type": "restore", "event_id": 99}],
+        }).json()
+        self.assertEqual(out["failure"]["code"], "EVENT_NOT_FOUND")
+
+        # 引用未知临时步骤
+        out = self._drill({
+            "version": 2,
+            "steps": [{"type": "restore", "temp_event_step": 1}],
+        }).json()
+        self.assertEqual(out["failure"]["code"], "TEMP_EVENT_NOT_FOUND")
+
+    def test_restore_already_restored_existing_event(self):
+        self._import()
+        self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "P6", "close_pipe_ids": ["P4"], "version": 1},
+        )
+        self.client.post(
+            "/api/isolation/events/1/restore", json={"version": 2}
+        )
+        out = self._drill({
+            "version": 3,
+            "steps": [{"type": "restore", "event_id": 1}],
+        }).json()
+        self.assertEqual(out["failure"]["code"], "EVENT_ALREADY_RESTORED")
+
+    def test_double_restore_temp_event_in_sequence(self):
+        self._import()
+        out = self._drill({
+            "version": 1,
+            "steps": [
+                {"type": "isolate", "fault_pipe_id": "P6",
+                 "close_pipe_ids": ["P4"]},
+                {"type": "restore", "temp_event_step": 1},
+                {"type": "restore", "temp_event_step": 1},
+            ],
+        }).json()
+        self.assertEqual(out["status"], "rejected")
+        self.assertEqual(out["failure"]["step_index"], 3)
+        self.assertEqual(out["failure"]["code"], "EVENT_ALREADY_RESTORED")
+
+    def test_source_switch_steps(self):
+        info = self._import(TWO_SOURCE_NETWORK)
+        self.assertEqual(info["version"], 1)
+        # 停运 S1：S2 顶供，无失供；版本推进
+        out = self._drill({
+            "version": 1,
+            "steps": [{"type": "source_switch",
+                       "targets": [{"source_id": "S1", "running": False}]}],
+        }).json()
+        self.assertEqual(out["status"], "ok")
+        self.assertTrue(out["steps"][0]["changed"])
+        self.assertEqual(out["steps"][0]["affected_sink_ids"], [])
+        self.assertEqual(out["final_state"]["version"], 2)
+        self.assertEqual(out["final_state"]["running_source_ids"], ["S2"])
+
+        # 空切换不推进版本
+        out = self._drill({
+            "version": 1,
+            "steps": [{"type": "source_switch",
+                       "targets": [{"source_id": "S1", "running": True}]}],
+        }).json()
+        self.assertEqual(out["status"], "ok")
+        self.assertFalse(out["steps"][0]["changed"])
+        self.assertEqual(out["final_state"]["version"], 1)
+
+        # 非法目标（节点不是水源）
+        out = self._drill({
+            "version": 1,
+            "steps": [{"type": "source_switch",
+                       "targets": [{"source_id": "U1", "running": False}]}],
+        }).json()
+        self.assertEqual(out["failure"]["code"], "SOURCE_SWITCH_INVALID")
+        self.assertEqual(out["failure"]["issues"][0]["code"], "SOURCE_NOT_SWITCHABLE")
+
+    def test_source_switch_unsafe_in_sequence(self):
+        self._import(TWO_SOURCE_NETWORK)
+        # 停运 S2 -> 隔离 Q2 只关 Q1（S2 停运时可行），演练里恢复 S2 有风险
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": False}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200)
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "Q2", "close_pipe_ids": ["Q1"], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200)
+        out = self._drill({
+            "version": 3,
+            "steps": [
+                {"type": "source_switch",
+                 "targets": [{"source_id": "S1", "running": False}]},
+                {"type": "source_switch",
+                 "targets": [{"source_id": "S2", "running": True}]},
+            ],
+        }).json()
+        self.assertEqual(out["status"], "rejected")
+        self.assertEqual(out["failure"]["step_index"], 2)
+        self.assertEqual(out["failure"]["code"], "SOURCE_SWITCH_UNSAFE")
+        self.assertEqual(
+            out["failure"]["issues"][0]["reachable_endpoints"], ["C"]
+        )
+        # 失败步骤不应用：版本停在步骤 1 后的 4；S1 已停运、S2 恢复被拒仍停运
+        self.assertEqual(out["final_state"]["version"], 4)
+        self.assertEqual(out["final_state"]["running_source_ids"], [])
+
+    def test_request_validation_422(self):
+        self._import()
+        bad_bodies = [
+            {"version": 1, "steps": []},  # 空步骤列表
+            {"version": 1, "steps": [{"fault_pipe_id": "P6"}]},  # 缺 type 鉴别字段
+            # 复供步骤同时给两个引用
+            {"version": 1, "steps": [
+                {"type": "restore", "event_id": 1, "temp_event_step": 1}]},
+            # 复供步骤两个引用都不给
+            {"version": 1, "steps": [{"type": "restore"}]},
+            # 水源切换目标为空
+            {"version": 1, "steps": [
+                {"type": "source_switch", "targets": []}]},
+            # 未知步骤类型
+            {"version": 1, "steps": [{"type": "explode"}]},
+            # 多余字段
+            {"version": 1, "steps": [
+                {"type": "isolate", "fault_pipe_id": "P6",
+                 "close_pipe_ids": [], "extra": 1}]},
+        ]
+        for body in bad_bodies:
+            r = self._drill(body)
+            self.assertEqual(r.status_code, 422, body)
 
 
 if __name__ == "__main__":

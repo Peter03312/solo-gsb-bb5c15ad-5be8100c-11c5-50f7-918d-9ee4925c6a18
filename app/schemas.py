@@ -8,9 +8,9 @@
 编号（id）为字符串，便于保留 "N01" 这类业务编号；排序时按字符串字典序。
 """
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 NodeType = Literal["source", "sink", "junction"]
 
@@ -572,3 +572,195 @@ class SnapshotDiffOut(BaseModel):
     source_states: SourceStateDiffOut
     open_faults: SnapshotFaultDiffOut
     supplied_sinks: SuppliedSinksDiffOut
+
+
+# ---------------------------------------------------------------- 有序操作演练（只读，多步）
+
+
+class DrillIsolateStepIn(BaseModel):
+    """演练步骤：隔离故障管段并关闭拟关阀门。"""
+
+    type: Literal["isolate"]
+    fault_pipe_id: str = Field(min_length=1, description="故障管段编号")
+    close_pipe_ids: list[str] = Field(
+        default_factory=list, description="拟关闭的阀门管段编号列表"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+class DrillRestoreStepIn(BaseModel):
+    """演练步骤：复供。
+
+    event_id 引用现存隔离事件；temp_event_step 引用本次先前隔离步骤
+    （从 1 开始的步骤序号）产生的临时事件；二者恰好给一个。
+    """
+
+    type: Literal["restore"]
+    event_id: int | None = Field(
+        default=None,
+        ge=1,
+        description="现存隔离事件编号（GET /api/isolation/events 中的 id）",
+    )
+    temp_event_step: int | None = Field(
+        default=None,
+        ge=1,
+        description="本次先前隔离步骤的序号（从 1 开始），引用其临时事件",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def _exactly_one_ref(self):
+        if (self.event_id is None) == (self.temp_event_step is None):
+            raise ValueError(
+                "复供步骤必须且只能给出 event_id 与 temp_event_step 中的一个"
+            )
+        return self
+
+
+class DrillSourceSwitchStepIn(BaseModel):
+    """演练步骤：一批水源切换到目标运行状态。"""
+
+    type: Literal["source_switch"]
+    targets: list[SourceTargetIn] = Field(
+        min_length=1, description="水源编号与目标运行状态列表（同批编号不得重复）"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
+DrillStepIn = Annotated[
+    Union[
+        DrillIsolateStepIn,
+        DrillRestoreStepIn,
+        DrillSourceSwitchStepIn,
+    ],
+    Field(discriminator="type"),
+]
+
+
+class DrillSequenceIn(BaseModel):
+    """有序隔离 / 复供 / 水源切换演练入参。
+
+    以当前管网与已读版本为起点，在服务内存中按顺序逐步应用并校验；
+    全程只读，不推进真实版本、不改阀位 / 水源状态 / 事件 / 快照。
+    """
+
+    version: StrictInt = Field(ge=0, description="读取管网时的版本号，空网为 0")
+    steps: list[DrillStepIn] = Field(
+        min_length=1, description="有序演练步骤（至少 1 步）"
+    )
+
+
+class DrillErrorOut(BaseModel):
+    code: str
+    message: str
+    # 结构性问题明细（形态随 code 而变：PLAN_INVALID 为管段问题，
+    # RESTORE_UNSAFE / SOURCE_SWITCH_UNSAFE 为含 reachable_endpoints 的风险明细）
+    issues: list[dict] | None = None
+
+
+class DrillEventRefOut(BaseModel):
+    """复供步骤引用的事件：existing=现存事件，temporary=本次隔离产生的临时事件。"""
+
+    kind: Literal["existing", "temporary"]
+    event_id: int | None = None
+    step_index: int | None = None
+
+
+class DrillBlockReasonOut(BaseModel):
+    code: str
+    message: str
+    pipe_id: str | None = None
+    reachable_endpoints: list[str] = []
+
+
+class DrillStepOut(BaseModel):
+    """单步演练结果。
+
+    status=applied 表示该步已应用到演练态；rejected 表示该步非法/不安全，
+    为演练中的最后一步（后续步骤不再执行）。每步的 affected_sink_ids /
+    restored_sink_ids 均相对上一步应用后的演练态计算。
+    """
+
+    index: int
+    type: Literal["isolate", "restore", "source_switch"]
+    status: Literal["applied", "rejected"]
+    version: int | None = None
+    error: DrillErrorOut | None = None
+    affected_sink_ids: list[str] = []
+    restored_sink_ids: list[str] = []
+    # 隔离步骤
+    fault_pipe_id: str | None = None
+    close_pipe_ids: list[str] | None = None
+    isolatable: bool | None = None
+    temp_event_id: int | None = None
+    event_ref: DrillEventRefOut | None = None
+    issues: list[dict] | None = None
+    # 复供步骤
+    reopen_pipe_ids: list[str] | None = None
+    safe: bool | None = None
+    block_reasons: list[DrillBlockReasonOut] | None = None
+    # 水源切换步骤
+    targets: list[SourceTargetOut] | None = None
+    changed: bool | None = None
+
+
+class DrillTempEventOut(BaseModel):
+    """本次隔离步骤产生的临时事件（负整数编号，演练结束即失效，不写库）。"""
+
+    temp_event_id: int
+    step_index: int
+    fault_pipe_id: str
+    closed_pipe_ids: list[str]
+    restored: bool
+
+
+class DrillValveOut(BaseModel):
+    pipe_id: str
+    has_valve: bool
+    valve_closed: bool
+
+
+class DrillOpenFaultOut(BaseModel):
+    event_id: int
+    fault_pipe_id: str
+    # true=本次隔离产生的临时事件；false=现存待修复事件
+    temporary: bool
+
+
+class DrillFinalStateOut(BaseModel):
+    """演练结束（或首个失败步骤的前一步）时的演练态。"""
+
+    version: int
+    running_source_ids: list[str]
+    valves: list[DrillValveOut]
+    open_faults: list[DrillOpenFaultOut]
+    supplied_sink_ids: list[str]
+
+
+class DrillFailureOut(BaseModel):
+    """首个非法 / 不安全步骤（演练在此停止，后续步骤不再执行）。"""
+
+    step_index: int
+    code: str
+    message: str
+    issues: list[dict] | None = None
+
+
+class DrillSequenceOut(BaseModel):
+    """有序演练结果：逐步结果、临时事件引用与最终演练态。
+
+    read_only 恒为 true：真实版本、阀位、水源状态、事件、快照均不变；
+    失败时 final_state 为最后一次成功应用后的状态（不含失败步骤变更）。
+    """
+
+    version: int = Field(description="演练开始时读到的真实当前版本")
+    version_match: bool
+    status: Literal["ok", "rejected"]
+    read_only: bool = True
+    steps: list[DrillStepOut]
+    failure: DrillFailureOut | None = None
+    temp_events: list[DrillTempEventOut]
+    final_state: DrillFinalStateOut
